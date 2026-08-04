@@ -117,6 +117,10 @@ class VoiceClient:
         self._music_proc: subprocess.Popen | None = None
         self._music_lock = threading.Lock()
         self._music_stop = threading.Event()
+        self._current_track_id = ""
+        self._current_source = ""
+        self._volume_level = 7  # 1..10
+        self._mpv_ipc_path = Path(tempfile.gettempdir()) / f"voice-mpv-{os.getpid()}.sock"
 
     def run(self) -> None:
         logger.info("Backend: %s", self.backend_url)
@@ -125,6 +129,7 @@ class VoiceClient:
         self._configure_audio_device()
         self._warmup_backend()
         self._init_wake()
+        self._sync_volume_from_backend()
         if self.music_poll:
             self._start_music_poller()
         logger.info(
@@ -906,34 +911,131 @@ class VoiceClient:
                 logger.debug("Music poll failed: %s", exc)
             self._music_stop.wait(self.music_poll_interval)
 
+    def _sync_volume_from_backend(self) -> None:
+        """Pull last known volume from server; fall back to local default."""
+        url = f"{self.backend_url}/v1/music/status/{self.device_id}"
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.get(url)
+            if response.status_code < 400:
+                payload = response.json() or {}
+                level = int(payload.get("volume") or self._volume_level)
+                self._set_volume(level)
+                return
+        except Exception as exc:
+            logger.debug("Volume sync failed: %s", exc)
+        self._apply_pulse_volume(self._volume_to_percent(self._volume_level))
+
     def _handle_playback(self, command: dict) -> None:
         action = str(command.get("action") or "").strip().lower()
         if action == "play":
             stream_url = str(command.get("url") or "").strip()
             title = str(command.get("title") or "").strip()
             artist = str(command.get("artist") or "").strip()
+            track_id = str(command.get("track_id") or "").strip()
+            source = str(command.get("source") or "").strip()
             if not stream_url:
                 logger.error("Playback command missing stream URL")
                 return
             label = f"{artist} — {title}".strip(" —") or title or stream_url
             logger.info("Playing music: %s", label)
-            self._start_music(stream_url)
+            self._start_music(stream_url, track_id=track_id, source=source)
             return
         if action == "pause":
             self._pause_music()
             return
         if action == "stop":
             self._stop_music()
+            return
+        if action == "volume":
+            try:
+                level = int(command.get("volume") or 0)
+            except (TypeError, ValueError):
+                level = 0
+            if level:
+                self._set_volume(level)
 
-    def _start_music(self, stream_url: str) -> None:
+    @staticmethod
+    def _volume_to_percent(level: int) -> int:
+        level = max(1, min(10, int(level)))
+        return level * 10
+
+    def _assistant_gain(self) -> float:
+        """Linear gain for TTS / any sounddevice playback. 1→0.1 … 10→1.0."""
+        return self._volume_to_percent(self._volume_level) / 100.0
+
+    def _set_volume(self, level: int) -> None:
+        """Master volume for the whole assistant: TTS + music + Pulse sink."""
+        level = max(1, min(10, int(level)))
+        self._volume_level = level
+        percent = self._volume_to_percent(level)
+        logger.info("Assistant volume %s/10 (%s%%)", level, percent)
+        self._apply_mpv_volume(percent)
+        self._apply_pulse_volume(percent)
+
+    def _apply_mpv_volume(self, percent: int) -> None:
+        sock = self._mpv_ipc_path
+        if not sock.exists():
+            return
+        try:
+            import socket
+
+            payload = json.dumps(
+                {"command": ["set_property", "volume", float(percent)]}
+            ).encode("utf-8") + b"\n"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(1.5)
+                client.connect(str(sock))
+                client.sendall(payload)
+                client.recv(4096)
+        except Exception as exc:
+            logger.debug("mpv volume IPC failed: %s", exc)
+
+    def _apply_pulse_volume(self, percent: int) -> None:
+        # Affects Bluetooth/USB sink used for TTS + music host audio.
+        try:
+            subprocess.run(
+                [
+                    "pactl",
+                    "set-sink-volume",
+                    "@DEFAULT_SINK@",
+                    f"{int(percent)}%",
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+        except FileNotFoundError:
+            logger.debug("pactl not found — skipping system volume")
+        except Exception as exc:
+            logger.debug("pactl volume failed: %s", exc)
+
+    def _start_music(
+        self,
+        stream_url: str,
+        *,
+        track_id: str = "",
+        source: str = "",
+    ) -> None:
         with self._music_lock:
             self._terminate_music_proc()
+            self._current_track_id = track_id
+            self._current_source = source
+            percent = self._volume_to_percent(self._volume_level)
+            ipc = str(self._mpv_ipc_path)
+            try:
+                self._mpv_ipc_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             try:
                 self._music_proc = subprocess.Popen(
                     [
                         self.mpv_command,
                         "--no-video",
                         "--really-quiet",
+                        f"--volume={percent}",
+                        f"--input-ipc-server={ipc}",
                         stream_url,
                     ],
                     stdout=subprocess.DEVNULL,
@@ -948,6 +1050,49 @@ class VoiceClient:
             except Exception:
                 logger.exception("Failed to start mpv")
                 self._music_proc = None
+            else:
+                threading.Thread(
+                    target=self._watch_music_proc,
+                    name="music-watch",
+                    daemon=True,
+                ).start()
+
+    def _watch_music_proc(self) -> None:
+        proc = self._music_proc
+        if proc is None:
+            return
+        code = proc.wait()
+        with self._music_lock:
+            if self._music_proc is not proc:
+                return  # replaced or stopped
+            self._music_proc = None
+            track_id = self._current_track_id
+            source = self._current_source
+            self._current_track_id = ""
+            self._current_source = ""
+        if code != 0:
+            return
+        # Natural end — ask server for next Моя волна track if active.
+        if source == "yandex-wave" or track_id:
+            self._report_track_finished(track_id)
+
+    def _report_track_finished(self, track_id: str) -> None:
+        url = f"{self.backend_url}/v1/music/status/{self.device_id}"
+        try:
+            with httpx.Client(timeout=20.0) as client:
+                client.post(
+                    url,
+                    json={
+                        "device_id": self.device_id,
+                        "playing": False,
+                        "action": "track_finished",
+                        "title": "",
+                        "artist": "",
+                    },
+                )
+            logger.info("Reported track_finished (track_id=%s)", track_id or "-")
+        except Exception as exc:
+            logger.debug("track_finished report failed: %s", exc)
 
     def _pause_music(self) -> None:
         with self._music_lock:
@@ -956,20 +1101,34 @@ class VoiceClient:
 
     def _stop_music(self) -> None:
         with self._music_lock:
+            self._current_track_id = ""
+            self._current_source = ""
             self._terminate_music_proc()
 
     def _terminate_music_proc(self) -> None:
         proc = self._music_proc
         self._music_proc = None
         if proc is None:
+            try:
+                self._mpv_ipc_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             return
         if proc.poll() is not None:
+            try:
+                self._mpv_ipc_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             return
         proc.terminate()
         try:
             proc.wait(timeout=2.0)
         except subprocess.TimeoutExpired:
             proc.kill()
+        try:
+            self._mpv_ipc_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def _play_wav(self, wav_bytes: bytes, reply_text: str = "") -> np.ndarray | None:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -987,6 +1146,9 @@ class VoiceClient:
             data = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32767.0
             if channels > 1:
                 data = data.reshape(-1, channels)
+
+            # Master assistant volume (1–10) applies to spoken replies too.
+            data = data * self._assistant_gain()
 
             if not self.barge_in:
                 sd.play(data, rate)
