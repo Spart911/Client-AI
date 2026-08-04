@@ -6,7 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     # piwheels: prebuilt wheels for armv7 (Pi 3B 32-bit) — avoids compiling numpy/cffi
     PIP_EXTRA_INDEX_URL=https://www.piwheels.org/simple \
-    HOME=/home/pi
+    HOME=/home/pi \
+    VOSK_MODEL_PATH=/opt/vosk/vosk-model-small-ru-0.22
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       portaudio19-dev \
@@ -18,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       mpv \
       alsa-utils \
       ca-certificates \
+      unzip \
       gcc \
       g++ \
     && rm -rf /var/lib/apt/lists/*
@@ -31,12 +33,15 @@ COPY requirements.txt .
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt
 
-COPY pi_assistant.py docker-entrypoint.sh ./
-RUN chmod +x /app/docker-entrypoint.sh \
-    && mkdir -p /home/pi/.cache/vosk \
-    && chown -R pi:pi /home/pi /app
+# Model is vendored in git (models/) — no download from alphacephei at build/runtime.
+COPY models/vosk-model-small-ru-0.22.zip /tmp/vosk.zip
+RUN mkdir -p /opt/vosk \
+    && unzip -q /tmp/vosk.zip -d /opt/vosk \
+    && rm -f /tmp/vosk.zip
 
-# Root only to chown the vosk volume, then drop to user pi.
-USER root
-ENTRYPOINT ["/app/docker-entrypoint.sh"]
+COPY pi_assistant.py .
+RUN chown -R pi:pi /home/pi /app
+
+USER pi
+
 CMD ["python", "pi_assistant.py"]

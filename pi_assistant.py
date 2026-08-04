@@ -24,7 +24,6 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.request
 import wave
 import zipfile
 from pathlib import Path
@@ -738,14 +737,72 @@ class VoiceClient:
 
         cache_root.mkdir(parents=True, exist_ok=True)
         zip_path = cache_root / f"{VOSK_MODEL_DIRNAME}.zip"
-        logger.info("Downloading Vosk RU model (~50MB)…")
-        urllib.request.urlretrieve(VOSK_MODEL_URL, zip_path)
+        urls = [
+            VOSK_MODEL_URL,
+        ]
+        last_error: Exception | None = None
+        for url in urls:
+            try:
+                logger.info("Downloading Vosk RU model (~50MB) from %s …", url)
+                self._download_file(url, zip_path)
+                break
+            except Exception as exc:
+                last_error = exc
+                logger.warning("Vosk download failed (%s): %s", url, exc)
+                zip_path.unlink(missing_ok=True)
+        else:
+            raise RuntimeError(
+                "Failed to download Vosk model. "
+                "Seed manually: scripts/seed-vosk-model.sh"
+            ) from last_error
+
         with zipfile.ZipFile(zip_path, "r") as archive:
             archive.extractall(cache_root)
         zip_path.unlink(missing_ok=True)
         if not model_dir.is_dir():
             raise RuntimeError(f"Vosk extract failed, expected {model_dir}")
         return str(model_dir)
+
+    @staticmethod
+    def _download_file(url: str, dest: Path, *, attempts: int = 3) -> None:
+        """Stream download with timeout and retries (alphacephei often stalls on Pi)."""
+        timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+                    with client.stream("GET", url) as response:
+                        response.raise_for_status()
+                        total = int(response.headers.get("content-length") or 0)
+                        done = 0
+                        last_log = 0
+                        with dest.open("wb") as out:
+                            for chunk in response.iter_bytes(chunk_size=256 * 1024):
+                                out.write(chunk)
+                                done += len(chunk)
+                                if total and done - last_log >= max(total // 10, 1):
+                                    logger.info(
+                                        "Vosk download: %.0f%% (%d / %d MB)",
+                                        100.0 * done / total,
+                                        done // (1024 * 1024),
+                                        total // (1024 * 1024),
+                                    )
+                                    last_log = done
+                if dest.stat().st_size < 1_000_000:
+                    raise RuntimeError(
+                        f"Downloaded file too small ({dest.stat().st_size} bytes)"
+                    )
+                return
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "Download attempt %d/%d failed: %s", attempt, attempts, exc
+                )
+                dest.unlink(missing_ok=True)
+                time.sleep(min(5 * attempt, 15))
+        raise RuntimeError(
+            f"Download failed after {attempts} attempts"
+        ) from last_error
 
     def _start_music_poller(self) -> None:
         thread = threading.Thread(

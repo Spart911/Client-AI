@@ -77,6 +77,7 @@ speaker-test -t wav -c 2
 |------|------|
 | `pi_assistant.py` | Клиент (Vosk + sounddevice + mpv) |
 | `Dockerfile` / `docker-compose.yml` | Образ и запуск |
+| `models/vosk-model-small-ru-0.22.zip` | Модель Vosk в git (~44MB, без скачивания с alphacephei) |
 | `requirements.txt` | Python deps |
 | `.env.example` | Шаблон env |
 | `scripts/update.sh` | Git pull + rebuild |
