@@ -8,7 +8,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_EXTRA_INDEX_URL=https://www.piwheels.org/simple \
     HOME=/home/pi \
     OWW_MODEL=alexa \
-    OWW_FRAMEWORK=onnx \
+    # armv7: onnxruntime wheels missing → default tflite (Dockerfile installs runtime)
+    OWW_FRAMEWORK=tflite \
     PULSE_SERVER=unix:/run/user/1000/pulse/native \
     XDG_RUNTIME_DIR=/run/user/1000
 
@@ -35,10 +36,11 @@ RUN groupadd -g 29 audio 2>/dev/null || true \
 WORKDIR /app
 
 COPY requirements.txt .
+COPY scripts/install-oww-runtime.sh /tmp/install-oww-runtime.sh
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt \
-    # tflite-runtime helps when onnxruntime wheels are missing (some armv7 builds).
-    && (pip install tflite-runtime || true) \
+    && bash /tmp/install-oww-runtime.sh \
+    && rm -f /tmp/install-oww-runtime.sh \
     # Prefetch openWakeWord models (alexa + mel/embedding) into the image.
     && python -c "import openwakeword; openwakeword.utils.download_models()"
 

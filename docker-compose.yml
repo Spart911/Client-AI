@@ -14,7 +14,8 @@ services:
     environment:
       HOME: /home/pi
       OWW_MODEL: alexa
-      OWW_FRAMEWORK: onnx
+      # Pi 3B 32-bit: tflite (no onnxruntime armv7 wheels). arm64 may use onnx.
+      OWW_FRAMEWORK: tflite
       PULSE_SERVER: unix:/run/user/1000/pulse/native
       XDG_RUNTIME_DIR: /run/user/1000
     volumes:

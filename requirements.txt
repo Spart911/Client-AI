@@ -1,7 +1,8 @@
 # Raspberry Pi 3B+ voice client — openWakeWord (alexa) + mpv
+# onnxruntime has no official linux/armv7 wheels — install it only when available
+# (arm64). On 32-bit Pi use tflite-runtime (see Dockerfile).
 httpx>=0.27.0
 numpy>=1.24.0,<2.0.0
 sounddevice>=0.5.0
 openwakeword>=0.6.0
-onnxruntime>=1.16.0
 scipy>=1.11.0

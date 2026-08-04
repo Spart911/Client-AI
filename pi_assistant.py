@@ -66,7 +66,8 @@ MUSIC_GATE_MULT = 1.08
 
 DEFAULT_OWW_MODEL = "alexa"
 DEFAULT_OWW_THRESHOLD = 0.5
-DEFAULT_OWW_FRAMEWORK = "onnx"
+# tflite works on Pi 3B 32-bit; onnxruntime usually needs arm64/x86_64.
+DEFAULT_OWW_FRAMEWORK = "tflite"
 
 
 class VoiceClient:
