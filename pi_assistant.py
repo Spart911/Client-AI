@@ -384,10 +384,14 @@ class VoiceClient:
         quiet_frames = 0
         gate_logged = False
         last_score_log = 0.0
+        last_heartbeat = 0.0
+        frames_seen = 0
+        peak_energy = 0.0
+        peak_score = 0.0
 
         def callback(indata, frames, time_info, status) -> None:  # noqa: ARG001
             if status:
-                logger.debug("mic status: %s", status)
+                logger.warning("mic status: %s", status)
             q.put(indata.copy())
 
         def sync_music_duck() -> None:
@@ -480,6 +484,16 @@ class VoiceClient:
                             mono = mono[:block]
                     frame_f = mono.astype(np.float32) / 32768.0
                     frame_energy = self._rms(frame_f)
+                    frames_seen += 1
+                    if frame_energy > peak_energy:
+                        peak_energy = frame_energy
+                    if frames_seen == 1:
+                        logger.info(
+                            "Mic first frame: samples=%d rms=%.5f peak=%.5f",
+                            mono.size,
+                            frame_energy,
+                            float(np.max(np.abs(frame_f))),
+                        )
 
                     if use_gate:
                         gate_mult = (
@@ -530,25 +544,51 @@ class VoiceClient:
                     prediction = self._oww.predict(mono)
                     best_name = ""
                     best_score = 0.0
-                    for name in self._oww_labels:
-                        score = float(prediction.get(name, 0.0) or 0.0)
+                    # Prefer configured labels, but also scan every key OWW returns
+                    # (some builds name heads alexa_v0.1 instead of alexa).
+                    for name, raw in prediction.items():
+                        try:
+                            score = float(np.asarray(raw).reshape(-1)[0])
+                        except Exception:
+                            continue
                         if score > best_score:
                             best_score = score
-                            best_name = name
+                            best_name = str(name)
+                    if best_score > peak_score:
+                        peak_score = best_score
 
-                    if best_score >= max(0.15, score_limit * 0.4) and (
-                        best_score != last_score_log
+                    now = time.monotonic()
+                    if now - last_heartbeat >= 5.0:
+                        logger.info(
+                            "Mic heartbeat: rms=%.5f peak_rms=%.5f oww=%s=%.3f peak_score=%.3f frames=%d",
+                            frame_energy,
+                            peak_energy,
+                            best_name or (self._oww_labels[0] if self._oww_labels else "?"),
+                            best_score,
+                            peak_score,
+                            frames_seen,
+                        )
+                        last_heartbeat = now
+                        peak_energy = 0.0
+
+                    if best_score >= max(0.12, score_limit * 0.35) and (
+                        abs(best_score - last_score_log) >= 0.05
                     ):
-                        if best_score >= score_limit * 0.7:
-                            logger.info(
-                                "OWW score %s=%.3f energy=%.3f",
-                                best_name,
-                                best_score,
-                                frame_energy,
-                            )
+                        logger.info(
+                            "OWW score %s=%.3f energy=%.4f",
+                            best_name,
+                            best_score,
+                            frame_energy,
+                        )
                         last_score_log = best_score
 
-                    if best_score >= score_limit and frame_energy >= threshold * 0.5:
+                    # HFP Bluetooth mics are quiet — don't require full WAKE_ENERGY.
+                    # Strong OWW scores alone are enough (mic may look near-silent).
+                    energy_ok = (
+                        frame_energy >= min(threshold * 0.5, 0.002)
+                        or best_score >= max(0.85, score_limit)
+                    )
+                    if best_score >= score_limit and energy_ok:
                         stable += 1
                     else:
                         stable = 0
