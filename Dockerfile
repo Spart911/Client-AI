@@ -13,7 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libportaudio2 \
       libffi-dev \
       pkg-config \
-      libatlas3-base \
+      libopenblas0 \
+      libgfortran5 \
       mpv \
       alsa-utils \
       ca-certificates \
