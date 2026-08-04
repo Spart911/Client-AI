@@ -83,12 +83,14 @@ class VoiceClient:
         music_poll: bool = True,
         music_poll_interval: float = 2.0,
         mpv_command: str = "",
+        audio_device: str | int | None = None,
     ) -> None:
         self.backend_url = backend_url.rstrip("/")
         self.device_id = (device_id or "default").strip() or "default"
         self.music_poll = music_poll
         self.music_poll_interval = max(0.5, music_poll_interval)
         self.mpv_command = (mpv_command or "").strip() or shutil.which("mpv") or "mpv"
+        self.audio_device = audio_device
         normalized = [self._normalize(w) for w in wake_words if w.strip()]
         self.wake_words = list(dict.fromkeys(normalized))
         self.silence_sec = silence_sec
@@ -120,6 +122,7 @@ class VoiceClient:
         logger.info("Backend: %s", self.backend_url)
         logger.info("Device id: %s", self.device_id)
         logger.info("Wake phrases: %s", self.wake_words)
+        self._configure_audio_device()
         self._warmup_backend()
         self._init_wake()
         if self.music_poll:
@@ -163,6 +166,77 @@ class VoiceClient:
                     time.sleep(self.wake_cooldown_sec)
                     break
                 logger.info("Barge-in — capturing new command")
+
+    def _configure_audio_device(self) -> None:
+        """Pick sounddevice input/output; log what PortAudio sees (Pulse/ALSA)."""
+        try:
+            devices = sd.query_devices()
+        except Exception:
+            logger.exception("Cannot query audio devices")
+            return
+
+        for index, info in enumerate(devices):
+            logger.info(
+                "Audio[%d] in=%s out=%s name=%s rate=%.0f",
+                index,
+                info.get("max_input_channels", 0),
+                info.get("max_output_channels", 0),
+                info.get("name", "?"),
+                info.get("default_samplerate", 0),
+            )
+
+        resolved = self._resolve_audio_device(self.audio_device, devices)
+        if resolved is None:
+            try:
+                default_in, default_out = sd.default.device
+                logger.info(
+                    "Using PortAudio defaults in=%s out=%s",
+                    default_in,
+                    default_out,
+                )
+            except Exception:
+                logger.info("Using PortAudio system defaults")
+            return
+
+        sd.default.device = resolved
+        logger.info("AUDIO_INPUT_DEVICE resolved to %s", resolved)
+
+    @staticmethod
+    def _resolve_audio_device(
+        raw: str | int | None,
+        devices,
+    ) -> int | tuple[int | None, int | None] | None:
+        if raw is None or raw == "":
+            return None
+        if isinstance(raw, int):
+            return raw
+        text = str(raw).strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return int(text)
+
+        if "," in text:
+            left, right = text.split(",", 1)
+            inp = int(left) if left.strip().isdigit() else None
+            out = int(right) if right.strip().isdigit() else None
+            return (inp, out)
+
+        needle = text.lower()
+        input_match = None
+        output_match = None
+        for index, info in enumerate(devices):
+            name = str(info.get("name", "")).lower()
+            if needle not in name:
+                continue
+            if info.get("max_input_channels", 0) > 0 and input_match is None:
+                input_match = index
+            if info.get("max_output_channels", 0) > 0 and output_match is None:
+                output_match = index
+        if input_match is None and output_match is None:
+            logger.warning("AUDIO_INPUT_DEVICE=%r matched no devices", text)
+            return None
+        return (input_match, output_match)
 
     def _warmup_backend(self) -> None:
         try:
@@ -1062,6 +1136,11 @@ def main() -> None:
         default=os.getenv("MPV_COMMAND", ""),
         help="Path to mpv binary (default: mpv from PATH)",
     )
+    parser.add_argument(
+        "--audio-device",
+        default=os.getenv("AUDIO_INPUT_DEVICE", ""),
+        help="sounddevice index, 'in,out', or name substring (e.g. pulse / bluez)",
+    )
     args = parser.parse_args()
 
     wake_words = [raw.strip() for raw in args.wake.split(",") if raw.strip()]
@@ -1082,6 +1161,7 @@ def main() -> None:
         music_poll=args.music_poll,
         music_poll_interval=args.music_poll_interval,
         mpv_command=args.mpv,
+        audio_device=args.audio_device or None,
     )
     try:
         client.run()
