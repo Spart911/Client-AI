@@ -122,12 +122,61 @@ EOF
   echo "==> Enabled voice-client-update.timer"
 fi
 
+# --- Bluetooth auto-connect (user service, needs BT_DEVICE_MAC in .env) ---
+chmod +x "${REPO_DIR}/scripts/bt-connect.sh"
+USER_UNIT_DIR="${HOME_DIR}/.config/systemd/user"
+mkdir -p "${USER_UNIT_DIR}"
+cat > "${USER_UNIT_DIR}/voice-bt-connect.service" <<EOF
+[Unit]
+Description=Auto-connect Bluetooth speaker for voice-client-pi
+After=bluetooth.target network.target sound.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+WorkingDirectory=${REPO_DIR}
+Environment=ENV_FILE=${REPO_DIR}/.env
+Environment=BT_CONNECT_ONCE=false
+ExecStart=${REPO_DIR}/scripts/bt-connect.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+
+# Linger so the user service runs headless (no SSH session required).
+sudo loginctl enable-linger "${SERVICE_USER}" || true
+# BlueZ: reconnect trusted devices when they appear
+if [[ -f /etc/bluetooth/main.conf ]]; then
+  sudo sed -i 's/^#AutoEnable=true/AutoEnable=true/' /etc/bluetooth/main.conf || true
+  if ! grep -q '^AutoEnable=true' /etc/bluetooth/main.conf; then
+    sudo sed -i '/^\[Policy\]/a AutoEnable=true' /etc/bluetooth/main.conf || true
+  fi
+fi
+
+if grep -qE '^BT_DEVICE_MAC=.+' "${REPO_DIR}/.env" 2>/dev/null; then
+  # systemctl --user needs a session bus; try best-effort from install.
+  if systemctl --user daemon-reload 2>/dev/null \
+    && systemctl --user enable --now voice-bt-connect.service 2>/dev/null; then
+    echo "==> Enabled voice-bt-connect.service (BT_DEVICE_MAC from .env)"
+  else
+    echo "==> BT auto-connect unit installed. After login run:"
+    echo "    systemctl --user daemon-reload"
+    echo "    systemctl --user enable --now voice-bt-connect.service"
+  fi
+else
+  echo "==> BT auto-connect: set BT_DEVICE_MAC in .env, then:"
+  echo "    systemctl --user daemon-reload && systemctl --user enable --now voice-bt-connect.service"
+fi
+
 echo
 echo "Done."
 echo "  Logs:    docker compose -f ${REPO_DIR}/docker-compose.yml logs -f"
 echo "  Config:  ${REPO_DIR}/.env"
 echo "  Update:  ${REPO_DIR}/scripts/update.sh"
 echo "  Timer:   systemctl list-timers voice-client-update.timer"
+echo "  BT:      systemctl --user status voice-bt-connect.service"
 echo "  Mic:     arecord -l && speaker-test -t wav -c 2"
 echo
 echo "If docker permission denied: log out/in (or newgrp docker), then:"

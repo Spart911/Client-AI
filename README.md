@@ -66,6 +66,37 @@ journalctl -u voice-client-update.service -n 50
 
 Push в git → на Pi контейнер пересоберётся сам.
 
+## Bluetooth-колонка (автоподключение)
+
+1. Один раз спарить колонку (`bluetoothctl pair/trust/connect`).
+2. В `.env` указать MAC:
+
+```bash
+bluetoothctl devices
+# Device AA:BB:CC:DD:EE:FF MySpeaker
+```
+
+```env
+BT_DEVICE_MAC=AA:BB:CC:DD:EE:FF
+BT_PROFILE=handsfree_head_unit
+AUDIO_INPUT_DEVICE=pulse
+```
+
+3. Включить сервис:
+
+```bash
+chmod +x scripts/bt-connect.sh
+mkdir -p ~/.config/systemd/user
+# путь подставьте свой (install.sh делает это сам)
+systemctl --user daemon-reload
+systemctl --user enable --now voice-bt-connect.service
+sudo loginctl enable-linger "$USER"
+```
+
+Сервис каждые ~15 с переподключает колонку и ставит HFP + default sink/source.
+
+Ручной тест: `bash scripts/bt-connect.sh` (нужен `BT_DEVICE_MAC` в `.env`).
+
 ## Проверка аудио на хосте
 
 ```bash

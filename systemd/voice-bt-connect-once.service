@@ -1,0 +1,11 @@
+[Unit]
+Description=One-shot Bluetooth speaker connect for voice-client-pi
+After=bluetooth.target sound.target
+Wants=bluetooth.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Client-AI
+Environment=ENV_FILE=%h/Client-AI/.env
+Environment=BT_CONNECT_ONCE=true
+ExecStart=%h/Client-AI/scripts/bt-connect.sh
