@@ -4,12 +4,16 @@ FROM python:3.11-slim-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    # piwheels: prebuilt wheels for armv7 (Pi 3B 32-bit) — avoids compiling numpy/cffi
+    PIP_EXTRA_INDEX_URL=https://www.piwheels.org/simple \
     HOME=/home/pi \
     VOSK_MODEL_PATH=/opt/vosk/vosk-model-small-ru-0.22
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       portaudio19-dev \
       libportaudio2 \
+      libffi-dev \
+      pkg-config \
       libatlas3-base \
       mpv \
       alsa-utils \
