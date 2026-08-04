@@ -1,0 +1,16 @@
+services:
+  voice-client:
+    build: .
+    image: voice-client-pi:latest
+    container_name: voice-client-pi
+    restart: unless-stopped
+    env_file:
+      - .env
+    devices:
+      - /dev/snd:/dev/snd
+    group_add:
+      # Typical Debian/RPi OS audio GID; check with: getent group audio
+      - "29"
+    environment:
+      HOME: /home/pi
+      VOSK_MODEL_PATH: /opt/vosk/vosk-model-small-ru-0.22

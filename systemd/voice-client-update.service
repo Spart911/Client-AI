@@ -1,0 +1,14 @@
+[Unit]
+Description=Update voice-client-pi from Git and rebuild Docker
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=server-pi
+WorkingDirectory=/home/server-pi/voice-client-pi
+ExecStart=/home/server-pi/voice-client-pi/scripts/update.sh
+
+[Install]
+WantedBy=multi-user.target
