@@ -13,4 +13,10 @@ services:
       - "29"
     environment:
       HOME: /home/pi
-      VOSK_MODEL_PATH: /opt/vosk/vosk-model-small-ru-0.22
+      # Empty = auto-download into ~/.cache/vosk on first start (survives in volume)
+      VOSK_MODEL_PATH: ""
+    volumes:
+      - vosk-cache:/home/pi/.cache/vosk
+
+volumes:
+  vosk-cache:
