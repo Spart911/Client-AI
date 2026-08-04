@@ -13,7 +13,8 @@ services:
       - "29"
     environment:
       HOME: /home/pi
-      VOSK_MODEL_PATH: /opt/vosk/vosk-model-small-ru-0.22
+      OWW_MODEL: alexa
+      OWW_FRAMEWORK: onnx
       PULSE_SERVER: unix:/run/user/1000/pulse/native
       XDG_RUNTIME_DIR: /run/user/1000
     volumes:

@@ -1,6 +1,6 @@
 # voice-client-pi
 
-Голосовой клиент для Raspberry Pi: wake (Vosk «ассистент») → запись → backend → TTS + mpv (Яндекс Музыка).
+Голосовой клиент для Raspberry Pi: wake (**openWakeWord «alexa»**) → запись → backend → TTS + mpv (Яндекс Музыка).
 
 Запуск в **Docker**, автообновление через **git pull** + rebuild. На Pi клонируется только этот репозиторий.
 
@@ -25,7 +25,7 @@ cd ~/voice-client-pi
 DEVICE_ID=pi-livingroom BACKEND=http://voice.pora-ai.ru bash install.sh
 ```
 
-Скажите: «ассистент, включи кадилак» — ответ и музыка должны идти с колонки Pi.
+Скажите: «**alexa**, включи кадилак» — ответ и музыка должны идти с колонки Pi.
 
 ## Конфигурация (`.env`)
 
@@ -33,7 +33,9 @@ DEVICE_ID=pi-livingroom BACKEND=http://voice.pora-ai.ru bash install.sh
 |------------|--------|------------|
 | `VOICE_BACKEND_URL` | `http://voice.pora-ai.ru` | Backend assist API |
 | `MUSIC_DEVICE_ID` | `pi-livingroom` | ID устройства (как в Open WebUI music tool) |
-| `WAKE_WORDS` | `ассистент` | Wake-фразы через запятую |
+| `OWW_MODEL` | `alexa` | Pretrained openWakeWord (`alexa`, `hey jarvis`, …) |
+| `OWW_THRESHOLD` | `0.5` | Порог score 0–1 (ниже = чувствительнее) |
+| `OWW_FRAMEWORK` | `onnx` | `onnx` или `tflite` |
 | `MUSIC_POLL` | `true` | Фоновый poll `/v1/music/pending` |
 
 `.env` не коммитится.
@@ -75,26 +77,7 @@ speaker-test -t wav -c 2
 
 | Путь | Роль |
 |------|------|
-| `pi_assistant.py` | Клиент (Vosk + sounddevice + mpv) |
+| `pi_assistant.py` | Клиент (openWakeWord + sounddevice + mpv) |
 | `Dockerfile` / `docker-compose.yml` | Образ и запуск |
-| `models/vosk-model-small-ru-0.22.zip` | Модель Vosk в git (~44MB, без скачивания с alphacephei) |
-| `requirements.txt` | Python deps |
-| `.env.example` | Шаблон env |
-| `scripts/update.sh` | Git pull + rebuild |
-| `systemd/` | Timer автообновления |
-| `install.sh` | Docker + compose + timer |
 
-## Open WebUI music tool
-
-В Valves укажите `default_device_id` = тот же `MUSIC_DEVICE_ID` (например `pi-livingroom`).
-
-## Без Docker (отладка)
-
-```bash
-sudo apt install -y python3-venv portaudio19-dev mpv
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-set -a && source .env && set +a
-python pi_assistant.py
-```
+Wake раньше был на Vosk («ассистент»). Сейчас always-on — только OWW; STT по-прежнему на backend.

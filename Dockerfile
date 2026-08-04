@@ -7,7 +7,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     # piwheels: prebuilt wheels for armv7 (Pi 3B 32-bit) — avoids compiling numpy/cffi
     PIP_EXTRA_INDEX_URL=https://www.piwheels.org/simple \
     HOME=/home/pi \
-    VOSK_MODEL_PATH=/opt/vosk/vosk-model-small-ru-0.22 \
+    OWW_MODEL=alexa \
+    OWW_FRAMEWORK=onnx \
     PULSE_SERVER=unix:/run/user/1000/pulse/native \
     XDG_RUNTIME_DIR=/run/user/1000
 
@@ -24,7 +25,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libpulse0 \
       pulseaudio-utils \
       ca-certificates \
-      unzip \
       gcc \
       g++ \
     && rm -rf /var/lib/apt/lists/*
@@ -36,13 +36,11 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --upgrade pip \
-    && pip install -r requirements.txt
-
-# Model is vendored in git (models/) — no download from alphacephei at build/runtime.
-COPY models/vosk-model-small-ru-0.22.zip /tmp/vosk.zip
-RUN mkdir -p /opt/vosk \
-    && unzip -q /tmp/vosk.zip -d /opt/vosk \
-    && rm -f /tmp/vosk.zip
+    && pip install -r requirements.txt \
+    # tflite-runtime helps when onnxruntime wheels are missing (some armv7 builds).
+    && (pip install tflite-runtime || true) \
+    # Prefetch openWakeWord models (alexa + mel/embedding) into the image.
+    && python -c "import openwakeword; openwakeword.utils.download_models()"
 
 COPY asound.conf /etc/asound.conf
 COPY pi_assistant.py .

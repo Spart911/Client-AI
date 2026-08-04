@@ -1,10 +1,9 @@
 """
-Raspberry Pi voice client: Vosk wake («ассистент») → record → backend → play.
+Raspberry Pi voice client: openWakeWord («alexa») → record → backend → play.
 
-Optimized for Pi 3B: no openwakeword / onnxruntime — only Vosk + sounddevice + mpv.
-
-Barge-in: the wake phrase is also watched while TTS plays, so saying
-«ассистент …» cuts playback short and records the new command right away.
+Wake uses openWakeWord + onnxruntime (no always-on Vosk). STT/LLM/TTS stay
+on the backend. Barge-in: OWW also watches while TTS plays so saying
+«alexa …» cuts playback short and records the new command.
 """
 
 from __future__ import annotations
@@ -25,7 +24,6 @@ import tempfile
 import threading
 import time
 import wave
-import zipfile
 from pathlib import Path
 
 import httpx
@@ -40,27 +38,35 @@ logger = logging.getLogger("pi-client")
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
+# openWakeWord is most efficient on multiples of 80 ms (1280 samples @ 16 kHz).
+OWW_FRAME_SAMPLES = 1280
 
 # Below this the barge-in gate sits at the speaker bleed level and lets it through.
 BARGE_MULT_MIN = 1.05
 # Soften the reply while we listen for an interrupt — leaves headroom for the
 # mic at any system volume (bleed scales with the speakers, the user's voice does not).
 BARGE_PLAYBACK_GAIN = 0.62
-# Keep decoding this long after a burst dips under the gate: quiet parts inside
-# a word are still speech, and dropping them leaves Vosk with unusable scraps.
+# Keep feeding OWW this long after a burst dips under the gate.
 BARGE_HANGOVER_FRAMES = 4
 # Replay the frames just before the burst so the wake phrase keeps its onset.
 BARGE_ONSET_FRAMES = 2
 # Seconds to wait for the actual command after the reply was cut short.
 BARGE_COMMAND_WAIT_SEC = 5.0
-# Drop the recognizer if the partial is this long and still no wake — TTS junk.
-BARGE_MAX_PARTIAL_WORDS = 8
+# After silence is detected, keep a short pad so word endings aren't clipped.
+RECORD_END_PAD_SEC = 0.35
+# Quiet tail after TTS so ALSA/Pulse underruns don't eat the last syllable.
+TTS_END_PAD_SEC = 0.35
+# While waiting for wake with music on: keep mpv quieter so speech
+# can clear the mic without shouting (fraction of the user's 1–10 volume).
+MUSIC_LISTEN_DUCK = 0.35
+# Extra duck once a speech burst is heard over the music floor.
+MUSIC_SPEECH_DUCK = 0.12
+# Gate over music bleed (slightly softer than TTS barge-in).
+MUSIC_GATE_MULT = 1.08
 
-# Small RU model — fits Raspberry Pi 3B (≈50MB).
-VOSK_MODEL_URL = (
-    "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip"
-)
-VOSK_MODEL_DIRNAME = "vosk-model-small-ru-0.22"
+DEFAULT_OWW_MODEL = "alexa"
+DEFAULT_OWW_THRESHOLD = 0.5
+DEFAULT_OWW_FRAMEWORK = "onnx"
 
 
 class VoiceClient:
@@ -69,12 +75,15 @@ class VoiceClient:
     def __init__(
         self,
         backend_url: str,
-        wake_words: list[str],
-        silence_sec: float = 1.2,
+        wake_words: list[str] | None = None,
+        silence_sec: float = 1.8,
         max_utterance_sec: float = 20.0,
         energy_threshold: float = 0.01,
-        vosk_model_path: str = "",
-        wake_min_conf: float = 0.55,
+        oww_model: str = DEFAULT_OWW_MODEL,
+        oww_threshold: float = DEFAULT_OWW_THRESHOLD,
+        oww_framework: str = DEFAULT_OWW_FRAMEWORK,
+        oww_vad_threshold: float = 0.0,
+        oww_model_path: str = "",
         wake_cooldown_sec: float = 2.0,
         wake_stable_frames: int = 2,
         barge_in: bool = True,
@@ -91,15 +100,25 @@ class VoiceClient:
         self.music_poll_interval = max(0.5, music_poll_interval)
         self.mpv_command = (mpv_command or "").strip() or shutil.which("mpv") or "mpv"
         self.audio_device = audio_device
-        normalized = [self._normalize(w) for w in wake_words if w.strip()]
-        self.wake_words = list(dict.fromkeys(normalized))
+        # Display / logging only — detection is the OWW model (default alexa).
+        label = (oww_model or DEFAULT_OWW_MODEL).strip() or DEFAULT_OWW_MODEL
+        if wake_words:
+            normalized = [self._normalize(w) for w in wake_words if w.strip()]
+            self.wake_words = list(dict.fromkeys(normalized)) or [label]
+        else:
+            self.wake_words = [label]
+        self.oww_model = label
+        self.oww_threshold = float(np.clip(oww_threshold, 0.05, 0.99))
+        self.oww_framework = (oww_framework or DEFAULT_OWW_FRAMEWORK).strip().lower()
+        if self.oww_framework not in ("onnx", "tflite"):
+            self.oww_framework = DEFAULT_OWW_FRAMEWORK
+        self.oww_vad_threshold = max(0.0, float(oww_vad_threshold))
+        self.oww_model_path = (oww_model_path or "").strip()
         self.silence_sec = silence_sec
         self.max_utterance_sec = max_utterance_sec
         self.energy_threshold = energy_threshold
-        self.vosk_model_path = vosk_model_path
-        self.wake_min_conf = wake_min_conf
         self.wake_cooldown_sec = wake_cooldown_sec
-        # ~250ms blocks: 3 frames ≈ 0.75s of stable partial before accept.
+        # Consecutive OWW frames (80 ms) above threshold before accept.
         self.wake_stable_frames = max(1, wake_stable_frames)
         self.barge_in = barge_in
         # Headroom over the loudest bleed frame of our own reply. Keep it small:
@@ -111,7 +130,8 @@ class VoiceClient:
                 barge_energy_mult,
                 BARGE_MULT_MIN,
             )
-        self._vosk_model = None
+        self._oww = None
+        self._oww_labels: list[str] = []
         self._wake_mode = "none"
         self._last_wake_ts = 0.0
         self._music_proc: subprocess.Popen | None = None
@@ -121,11 +141,12 @@ class VoiceClient:
         self._current_source = ""
         self._volume_level = 7  # 1..10
         self._mpv_ipc_path = Path(tempfile.gettempdir()) / f"voice-mpv-{os.getpid()}.sock"
+        self._in_wake_listen = False
 
     def run(self) -> None:
         logger.info("Backend: %s", self.backend_url)
         logger.info("Device id: %s", self.device_id)
-        logger.info("Wake phrases: %s", self.wake_words)
+        logger.info("Wake model: %s (threshold=%.2f)", self.oww_model, self.oww_threshold)
         self._configure_audio_device()
         self._warmup_backend()
         self._init_wake()
@@ -133,9 +154,9 @@ class VoiceClient:
         if self.music_poll:
             self._start_music_poller()
         logger.info(
-            "Wake mode: %s — say «%s …» then your command (one phrase is ok).",
+            "Wake mode: %s — say «%s …» then your command.",
             self._wake_mode,
-            self.wake_words[0] if self.wake_words else "wake",
+            self.wake_words[0] if self.wake_words else "alexa",
         )
         logger.info(
             "Barge-in: %s",
@@ -151,6 +172,7 @@ class VoiceClient:
             self._stop_music()
             self._last_wake_ts = time.monotonic()
             logger.info("Wake detected — capturing command")
+            self._play_listen_cue()
             interrupted = False
             while True:
                 wav_bytes = self._record_until_silence(
@@ -171,6 +193,7 @@ class VoiceClient:
                     time.sleep(self.wake_cooldown_sec)
                     break
                 logger.info("Barge-in — capturing new command")
+                self._play_listen_cue()
 
     def _configure_audio_device(self) -> None:
         """Pick sounddevice input/output; log what PortAudio sees (Pulse/ALSA)."""
@@ -253,277 +276,306 @@ class VoiceClient:
             sys.exit(1)
 
     def _init_wake(self) -> None:
-        self._init_vosk()
+        self._init_oww()
 
-    def _init_vosk(self) -> None:
+    def _init_oww(self) -> None:
         try:
-            from vosk import KaldiRecognizer, Model, SetLogLevel
-
-            SetLogLevel(-1)
-            model_path = self._ensure_vosk_model()
-            self._vosk_model = Model(model_path)
-            # Free decoder (no grammar): grammar forces similar words like
-            # «асимметрию» into «ассистент».
-            _ = KaldiRecognizer(self._vosk_model, SAMPLE_RATE)
-            self._wake_mode = "vosk"
-            logger.info("Vosk Russian wake ready (%s)", model_path)
-            logger.info("Wake match: phrase prefix (no grammar)")
+            import openwakeword
+            from openwakeword.model import Model
         except Exception as exc:
             logger.error(
-                "Vosk wake init failed (%s). Install: pip install vosk",
+                "openWakeWord import failed (%s). Install: pip install openwakeword onnxruntime",
                 exc,
             )
             sys.exit(1)
 
+        try:
+            # Mel + embedding (+ optional VAD) live next to the wake head.
+            openwakeword.utils.download_models()
+            wake_ref = self.oww_model_path or self.oww_model
+            frameworks = [self.oww_framework]
+            if self.oww_framework == "onnx":
+                frameworks.append("tflite")
+            elif self.oww_framework == "tflite":
+                frameworks.append("onnx")
+            last_error: Exception | None = None
+            for framework in frameworks:
+                try:
+                    self._oww = Model(
+                        wakeword_models=[wake_ref],
+                        inference_framework=framework,
+                        vad_threshold=self.oww_vad_threshold,
+                    )
+                    self.oww_framework = framework
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning("openWakeWord %s init failed: %s", framework, exc)
+                    self._oww = None
+            if self._oww is None:
+                raise RuntimeError(last_error or "no inference framework worked")
+            self._oww_labels = list(self._oww.models.keys())
+            if not self._oww_labels:
+                raise RuntimeError("openWakeWord loaded zero models")
+            self._wake_mode = "oww"
+            logger.info(
+                "openWakeWord ready: models=%s framework=%s threshold=%.2f vad=%.2f",
+                self._oww_labels,
+                self.oww_framework,
+                self.oww_threshold,
+                self.oww_vad_threshold,
+            )
+        except Exception as exc:
+            logger.error("openWakeWord init failed: %s", exc)
+            sys.exit(1)
+
     def _wait_for_wake(self) -> np.ndarray | None:
-        if self._wake_mode == "vosk":
-            return self._wait_vosk()
+        if self._wake_mode == "oww":
+            self._in_wake_listen = True
+            try:
+                return self._wait_oww(
+                    echo_gate=self._is_music_playing(),
+                    music_duck=True,
+                )
+            finally:
+                self._in_wake_listen = False
         raise RuntimeError("Wake engine is not initialized")
 
-    def _wait_vosk(
+    def _wait_oww(
         self,
         *,
         deadline: float | None = None,
         energy_threshold: float | None = None,
-        echo_text: str = "",
         respect_cooldown: bool = True,
         echo_gate: bool = False,
         stable_frames: int | None = None,
+        music_duck: bool = False,
     ) -> np.ndarray | None:
         """
-        Stream the mic until the wake phrase is heard; return the preroll audio.
+        Stream the mic until openWakeWord fires; return recent preroll audio.
 
         With a deadline (barge-in during playback) it returns None on timeout.
-        echo_gate keeps our own TTS out of the recognizer: decoding starts on a
-        burst louder than the speaker bleed and continues until the burst ends,
-        so the phrase reaches Vosk whole.
+        echo_gate keeps TTS/music out of the model: inference starts on a burst
+        louder than speaker bleed and continues until the burst ends.
         """
         from collections import deque
 
-        from vosk import KaldiRecognizer
-
-        assert self._vosk_model is not None
+        assert self._oww is not None
         threshold = (
             self.energy_threshold if energy_threshold is None else energy_threshold
         )
         stable_needed = (
             self.wake_stable_frames if stable_frames is None else max(1, stable_frames)
         )
-        # Free ASR — do not use keyword grammar (maps lookalikes to the wake word).
-        recognizer = KaldiRecognizer(self._vosk_model, SAMPLE_RATE)
-        recognizer.SetWords(True)
+        score_limit = self.oww_threshold
 
-        block = 4000  # ~250 ms @ 16 kHz int16
+        block = OWW_FRAME_SAMPLES
         q: queue.Queue[np.ndarray] = queue.Queue()
         stable = 0
-        last_partial = ""
-        last_heard_log = ""
-        # Finals arrive on a silence frame — keep recent energies for the gate.
-        recent_energy: deque[float] = deque(maxlen=8)
-        # Keep ~2s of float audio so «ассистент как дела» is not lost after wake.
-        # While TTS plays, keep less so the reply itself does not leak into it.
-        preroll: deque[np.ndarray] = deque(maxlen=4 if echo_gate else 8)
-        # Speaker bleed defines the noise floor during playback.
+        use_gate = bool(echo_gate)
+        music_mode = False
+        speech_ducked = False
+        # ~1.5 s of float audio after wake for a trailing command fragment.
+        preroll: deque[np.ndarray] = deque(maxlen=4 if use_gate else 20)
         floor_window: deque[float] = deque(maxlen=16)
-        pre_burst: deque[bytes] = deque(maxlen=BARGE_ONSET_FRAMES)
         pre_burst_f: deque[np.ndarray] = deque(maxlen=BARGE_ONSET_FRAMES)
         feeding = False
         quiet_frames = 0
         gate_logged = False
+        last_score_log = 0.0
 
         def callback(indata, frames, time_info, status) -> None:  # noqa: ARG001
             if status:
                 logger.debug("mic status: %s", status)
             q.put(indata.copy())
 
+        def sync_music_duck() -> None:
+            nonlocal use_gate, music_mode, speech_ducked, preroll
+            nonlocal stable, feeding, quiet_frames
+            if not music_duck:
+                return
+            playing = self._is_music_playing()
+            if playing and not music_mode:
+                music_mode = True
+                use_gate = True
+                preroll = deque(preroll, maxlen=4)
+                floor_window.clear()
+                pre_burst_f.clear()
+                feeding = False
+                quiet_frames = 0
+                speech_ducked = False
+                stable = 0
+                self._oww.reset()
+                self._duck_music(MUSIC_LISTEN_DUCK)
+                logger.info(
+                    "Music on — duck×%.2f + speech gate for wake listen",
+                    MUSIC_LISTEN_DUCK,
+                )
+            elif not playing and music_mode:
+                music_mode = False
+                speech_ducked = False
+                if not echo_gate:
+                    use_gate = False
+                    preroll = deque(preroll, maxlen=20)
+
+        def set_feeding(active: bool) -> None:
+            nonlocal feeding, quiet_frames, speech_ducked, stable
+            if active == feeding:
+                return
+            feeding = active
+            quiet_frames = 0
+            if active:
+                self._oww.reset()
+                stable = 0
+            if not music_mode:
+                return
+            if active:
+                self._duck_music(MUSIC_SPEECH_DUCK)
+                speech_ducked = True
+            elif speech_ducked:
+                self._duck_music(MUSIC_LISTEN_DUCK)
+                speech_ducked = False
+
         if deadline is None:
             logger.info(
-                "Listening for: %s (prefix, stable≥%d×250ms, energy≥%.3f)",
-                ", ".join(self.wake_words),
-                self.wake_stable_frames,
+                "Listening for openWakeWord %s (score≥%.2f, stable≥%d×80ms, energy≥%.3f)",
+                self._oww_labels,
+                score_limit,
+                stable_needed,
                 threshold,
             )
         else:
             logger.info(
-                "Barge-in armed: say «%s …» to interrupt (energy≥%.3f)",
-                self.wake_words[0] if self.wake_words else "wake",
+                "Barge-in armed: say «%s …» to interrupt (score≥%.2f, energy≥%.3f)",
+                self.wake_words[0] if self.wake_words else "alexa",
+                score_limit,
                 threshold,
             )
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-            blocksize=block,
-            callback=callback,
-        ):
-            while True:
-                if deadline is not None and time.monotonic() >= deadline:
-                    return None
-                try:
-                    chunk = q.get(timeout=0.25)
-                except queue.Empty:
-                    continue
-                mono = chunk.reshape(-1)
-                pcm = mono.tobytes()
-                frame_f = mono.astype(np.float32) / 32768.0
-                frame_energy = self._rms(frame_f)
-                recent_energy.append(frame_energy)
-                if not echo_gate:
-                    preroll.append(frame_f.copy())
-                energy = max(recent_energy) if recent_energy else frame_energy
 
-                if echo_gate:
-                    gate = self._echo_gate(floor_window, threshold)
-                    loud = gate is not None and frame_energy >= gate
-                    if not loud and not feeding:
-                        # Only the reply feeds the estimate — counting the user's
-                        # own voice would raise the gate against them.
-                        floor_window.append(frame_energy)
-                    if loud:
-                        quiet_frames = 0
-                        if not feeding:
-                            # New burst over the reply: decode it on its own, so
-                            # the wake phrase can still be the first thing heard.
-                            self._reset_recognizer(recognizer)
-                            stable = 0
-                            last_partial = ""
-                            feeding = True
-                            for onset in pre_burst:
-                                recognizer.AcceptWaveform(onset)
-                            pre_burst.clear()
-                            preroll.extend(pre_burst_f)
-                            pre_burst_f.clear()
-                            if not gate_logged:
-                                logger.info(
-                                    "Barge-in gate %.3f — heard %.3f over the reply",
-                                    gate,
-                                    frame_energy,
-                                )
-                                gate_logged = True
-                    elif feeding:
-                        quiet_frames += 1
-                        if quiet_frames > BARGE_HANGOVER_FRAMES:
-                            feeding = False
-                    if not feeding:
-                        pre_burst.append(pcm)
-                        pre_burst_f.append(frame_f.copy())
+        try:
+            self._oww.reset()
+            sync_music_duck()
+            with sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+                blocksize=block,
+                callback=callback,
+            ):
+                while True:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return None
+                    sync_music_duck()
+                    try:
+                        chunk = q.get(timeout=0.25)
+                    except queue.Empty:
                         continue
-                    # Preroll of a barge-in carries the user only: the reply we
-                    # gated out has no business in the command we send off.
-                    preroll.append(frame_f.copy())
+                    mono = chunk.reshape(-1)
+                    if mono.size != block:
+                        # PortAudio sometimes delivers short frames — pad/trim.
+                        if mono.size < block:
+                            mono = np.pad(mono, (0, block - mono.size))
+                        else:
+                            mono = mono[:block]
+                    frame_f = mono.astype(np.float32) / 32768.0
+                    frame_energy = self._rms(frame_f)
 
-                now = time.monotonic()
-                if respect_cooldown and now - self._last_wake_ts < self.wake_cooldown_sec:
-                    stable = 0
-                    last_partial = ""
-                    recognizer.AcceptWaveform(pcm)
-                    continue
+                    if use_gate:
+                        gate_mult = (
+                            MUSIC_GATE_MULT if music_mode else self.barge_energy_mult
+                        )
+                        gate = self._echo_gate(
+                            floor_window, threshold, mult=gate_mult
+                        )
+                        loud = gate is not None and frame_energy >= gate
+                        if not loud and not feeding:
+                            floor_window.append(frame_energy)
+                        if loud:
+                            quiet_frames = 0
+                            if not feeding:
+                                set_feeding(True)
+                                for onset in pre_burst_f:
+                                    preroll.append(onset)
+                                pre_burst_f.clear()
+                                if not gate_logged:
+                                    logger.info(
+                                        "Speech gate %.3f — heard %.3f over playback",
+                                        gate,
+                                        frame_energy,
+                                    )
+                                    gate_logged = True
+                        elif feeding:
+                            quiet_frames += 1
+                            if quiet_frames > BARGE_HANGOVER_FRAMES:
+                                set_feeding(False)
+                                stable = 0
+                        if not feeding:
+                            pre_burst_f.append(frame_f.copy())
+                            continue
+                        preroll.append(frame_f.copy())
+                    else:
+                        preroll.append(frame_f.copy())
 
-                if recognizer.AcceptWaveform(pcm):
-                    payload = json.loads(recognizer.Result())
-                    heard = self._normalize(payload.get("text") or "")
-                    conf = self._wake_confidence(payload)
-                    if heard and heard != last_heard_log:
-                        logger.info("Heard (final): %r", heard)
-                        last_heard_log = heard
-                    text = (
-                        self._wake_text_from_echo(heard, echo_text)
-                        if echo_gate
-                        else heard
-                    )
-                    if self._accept_wake(
-                        text,
-                        energy,
-                        conf,
-                        source="final",
-                        threshold=threshold,
-                        echo_text=echo_text,
+                    now = time.monotonic()
+                    if (
+                        respect_cooldown
+                        and now - self._last_wake_ts < self.wake_cooldown_sec
                     ):
-                        return self._preroll_array(preroll)
-                    if echo_gate and (
-                        self._looks_like_echo(heard, echo_text)
-                        or (heard and not self._wake_match(text))
-                    ):
-                        self._reset_recognizer(recognizer)
-                        feeding = False
-                        quiet_frames = 0
-                        preroll.clear()
-                    stable = 0
-                    last_partial = ""
-                    continue
-
-                partial = json.loads(recognizer.PartialResult()).get("partial") or ""
-                heard = self._normalize(partial)
-                text = (
-                    self._wake_text_from_echo(heard, echo_text) if echo_gate else heard
-                )
-                if echo_gate and heard and not text:
-                    # Entire partial was reply bleed — clear and wait for a new onset.
-                    if heard != last_heard_log:
-                        logger.info("Heard (partial): %r", heard)
-                        last_heard_log = heard
-                    self._reset_recognizer(recognizer)
-                    stable = 0
-                    last_partial = ""
-                    feeding = False
-                    quiet_frames = 0
-                    preroll.clear()
-                    continue
-                if not text or frame_energy < threshold * 0.5:
-                    # Do not reset stable on short dips if we already matched prefix.
-                    if not self._wake_match(last_partial):
+                        # Keep the model warm but ignore hits during cooldown.
+                        self._oww.predict(mono)
                         stable = 0
-                        last_partial = ""
-                    continue
+                        continue
 
-                matched = self._wake_match(text)
-                if not matched:
-                    if heard != last_partial and heard != last_heard_log:
-                        logger.info("Heard (partial): %r", heard)
-                        last_heard_log = heard
-                    stable = 0
-                    last_partial = text
-                    if echo_gate and (
-                        self._looks_like_echo(heard, echo_text)
-                        or len(heard.split()) >= BARGE_MAX_PARTIAL_WORDS
+                    prediction = self._oww.predict(mono)
+                    best_name = ""
+                    best_score = 0.0
+                    for name in self._oww_labels:
+                        score = float(prediction.get(name, 0.0) or 0.0)
+                        if score > best_score:
+                            best_score = score
+                            best_name = name
+
+                    if best_score >= max(0.15, score_limit * 0.4) and (
+                        best_score != last_score_log
                     ):
-                        # Our words slipped past the gate, or the partial is a
-                        # long TTS mess. Drop them so the wake phrase can still
-                        # land at the start of the next burst.
-                        self._reset_recognizer(recognizer)
-                        last_partial = ""
-                        feeding = False
-                        quiet_frames = 0
-                        preroll.clear()
-                    continue
+                        if best_score >= score_limit * 0.7:
+                            logger.info(
+                                "OWW score %s=%.3f energy=%.3f",
+                                best_name,
+                                best_score,
+                                frame_energy,
+                            )
+                        last_score_log = best_score
 
-                # Prefix stays matched while user continues: «ассистент» → «ассистент как».
-                if self._wake_match(last_partial):
-                    stable += 1
-                else:
-                    stable = 1
-                    logger.info("Wake candidate start: %r energy=%.3f", text, frame_energy)
-                last_partial = text
+                    if best_score >= score_limit and frame_energy >= threshold * 0.5:
+                        stable += 1
+                    else:
+                        stable = 0
 
-                if stable >= stable_needed:
-                    if self._accept_wake(
-                        text,
-                        energy,
-                        conf=1.0,
-                        source="partial",
-                        threshold=threshold,
-                        echo_text=echo_text,
-                    ):
+                    if stable >= stable_needed:
+                        logger.info(
+                            "Wake matched (oww): %s score=%.3f energy=%.3f",
+                            best_name or self.oww_model,
+                            best_score,
+                            frame_energy,
+                        )
                         return self._preroll_array(preroll)
-                    stable = 0
-                    last_partial = ""
+        finally:
+            if music_duck and music_mode:
+                self._restore_music_volume()
 
     def _preroll_array(self, preroll) -> np.ndarray | None:
         if not preroll:
             return None
         return np.concatenate(list(preroll))
 
-    def _echo_gate(self, window, threshold: float) -> float | None:
+    def _echo_gate(
+        self,
+        window,
+        threshold: float,
+        *,
+        mult: float | None = None,
+    ) -> float | None:
         """
         Energy a voice must beat to be heard over our own playback.
 
@@ -536,136 +588,8 @@ class VoiceClient:
             return None
         ordered = sorted(window)
         index = min(len(ordered) - 1, int(len(ordered) * 0.75))
-        return max(threshold, ordered[index] * self.barge_energy_mult)
-
-    def _wake_text_from_echo(self, text: str, echo_text: str) -> str:
-        """
-        Recover a wake-leading phrase from a stream that still contains the reply.
-
-        Interrupting means the recognizer hears the reply and the user in one
-        breath. Prefer text that starts at the wake word after reply tokens (or a
-        short stretch of misheard junk); otherwise strip leading reply words.
-        """
-        if not text:
-            return text
-        tokens = text.split()
-        echo_tokens = set(echo_text.split()) if echo_text else set()
-        wake_phrases = [w.split() for w in self.wake_words if w.split()]
-        for i in range(len(tokens)):
-            for phrase in wake_phrases:
-                n = len(phrase)
-                if tokens[i : i + n] != phrase:
-                    continue
-                before = tokens[:i]
-                if (
-                    not before
-                    or all(t in echo_tokens for t in before)
-                    or len(before) <= 3
-                ):
-                    return " ".join(tokens[i:])
-                return text
-        index = 0
-        while index < len(tokens) and tokens[index] in echo_tokens:
-            index += 1
-        return " ".join(tokens[index:]) if index else text
-
-    def _looks_like_echo(self, text: str, echo_text: str) -> bool:
-        """True when the words we just decoded are our own reply coming back."""
-        if not text or not echo_text:
-            return False
-        tokens = text.split()
-        # Two words in a row is where a coincidence stops being likely.
-        for size in (3, 2):
-            if len(tokens) >= size and " ".join(tokens[-size:]) in echo_text:
-                return True
-        # Long partial made mostly of reply words.
-        if len(tokens) >= 4:
-            echo_tokens = set(echo_text.split())
-            hits = sum(1 for t in tokens if t in echo_tokens)
-            if hits / len(tokens) >= 0.6:
-                return True
-        return False
-
-    def _reset_recognizer(self, recognizer) -> None:
-        try:
-            recognizer.Reset()
-        except Exception:
-            logger.debug("Vosk Reset failed", exc_info=True)
-
-    def _accept_wake(
-        self,
-        text: str,
-        energy: float,
-        conf: float,
-        source: str,
-        threshold: float | None = None,
-        echo_text: str = "",
-    ) -> bool:
-        if not text or text == "unk":
-            return False
-        limit = self.energy_threshold if threshold is None else threshold
-        if energy < limit:
-            logger.info("Skip wake (%s): low energy %.4f text=%r", source, energy, text)
-            return False
-        matched = self._wake_match(text)
-        if not matched:
-            return False
-        if echo_text and text in echo_text:
-            logger.info("Skip wake (%s): TTS echo text=%r", source, text)
-            return False
-        # conf==0 means "unknown" (no word scores) — do not hard-reject.
-        if conf > 0.0 and conf < self.wake_min_conf:
-            logger.info(
-                "Skip wake (%s): low conf %.2f text=%r",
-                source,
-                conf,
-                text,
-            )
-            return False
-        logger.info(
-            "Wake matched (%s): %s ← %r energy=%.3f conf=%.2f",
-            source,
-            matched,
-            text,
-            energy,
-            conf,
-        )
-        return True
-
-    def _wake_match(self, text: str) -> str | None:
-        """
-        Wake if the utterance *starts with* the wake phrase as whole tokens.
-
-        Supports one-shot «ассистент как дела». Rejects lookalikes like «асимметрию».
-        """
-        if not text:
-            return None
-        tokens = text.split()
-        for phrase in self.wake_words:
-            phrase_tokens = phrase.split()
-            n = len(phrase_tokens)
-            if n == 0 or len(tokens) < n:
-                continue
-            if tokens[:n] == phrase_tokens:
-                return phrase
-        return None
-
-    def _wake_confidence(self, payload: dict) -> float:
-        words = payload.get("result") or []
-        confs = []
-        for item in words:
-            if not isinstance(item, dict):
-                continue
-            word = self._normalize(str(item.get("word") or ""))
-            if not word or word == "unk":
-                continue
-            try:
-                confs.append(float(item.get("conf") or 0.0))
-            except (TypeError, ValueError):
-                continue
-        if not confs:
-            return 0.0
-        return float(min(confs))
+        factor = self.barge_energy_mult if mult is None else max(BARGE_MULT_MIN, mult)
+        return max(threshold, ordered[index] * factor)
 
     def _assist_and_play(self, wav_bytes: bytes) -> np.ndarray | None:
         """Send audio, play the reply; return barge-in preroll when interrupted."""
@@ -758,6 +682,8 @@ class VoiceClient:
         silence_blocks = int(self.silence_sec / 0.1)
         max_blocks = int(self.max_utterance_sec / 0.1)
         wait_blocks = int((start_timeout_sec or self.max_utterance_sec) / 0.1)
+        # Soft floor so quiet word endings don't count as silence immediately.
+        continue_threshold = self.energy_threshold * 0.4
         lead: list[np.ndarray] = []
         frames: list[np.ndarray] = []
         silent = 0
@@ -783,16 +709,27 @@ class VoiceClient:
                     silent = 0
                     frames.append(mono.copy())
                 elif started:
-                    silent += 1
                     frames.append(mono.copy())
-                    if silent >= silence_blocks:
-                        break
+                    if energy >= continue_threshold:
+                        # Soft speech / trailing consonants — don't rush to end.
+                        silent = max(0, silent - 1)
+                    else:
+                        silent += 1
+                        if silent >= silence_blocks:
+                            break
                 else:
                     frames.append(mono.copy())
                     if len(frames) > 5:
                         frames.pop(0)
                     if require_speech and index >= wait_blocks:
                         break
+
+            # Extra quiet pad after end-of-utterance so last syllables survive.
+            if started:
+                pad_blocks = max(1, int(RECORD_END_PAD_SEC / 0.1))
+                for _ in range(pad_blocks):
+                    data, _ = stream.read(block)
+                    frames.append(data[:, 0].copy())
 
         if require_speech and not started:
             logger.info("No command after the barge-in — back to wake listen")
@@ -802,86 +739,48 @@ class VoiceClient:
             return b""
         return self._frames_to_wav(np.concatenate(chunks))
 
-    def _ensure_vosk_model(self) -> str:
-        if self.vosk_model_path:
-            path = Path(self.vosk_model_path)
-            if not path.is_dir():
-                raise FileNotFoundError(f"Vosk model not found: {path}")
-            return str(path)
-
-        cache_root = Path.home() / ".cache" / "vosk"
-        model_dir = cache_root / VOSK_MODEL_DIRNAME
-        if model_dir.is_dir():
-            return str(model_dir)
-
-        cache_root.mkdir(parents=True, exist_ok=True)
-        zip_path = cache_root / f"{VOSK_MODEL_DIRNAME}.zip"
-        urls = [
-            VOSK_MODEL_URL,
-        ]
-        last_error: Exception | None = None
-        for url in urls:
-            try:
-                logger.info("Downloading Vosk RU model (~50MB) from %s …", url)
-                self._download_file(url, zip_path)
-                break
-            except Exception as exc:
-                last_error = exc
-                logger.warning("Vosk download failed (%s): %s", url, exc)
-                zip_path.unlink(missing_ok=True)
-        else:
-            raise RuntimeError(
-                "Failed to download Vosk model. "
-                "Seed manually: scripts/seed-vosk-model.sh"
-            ) from last_error
-
-        with zipfile.ZipFile(zip_path, "r") as archive:
-            archive.extractall(cache_root)
-        zip_path.unlink(missing_ok=True)
-        if not model_dir.is_dir():
-            raise RuntimeError(f"Vosk extract failed, expected {model_dir}")
-        return str(model_dir)
+    def _play_listen_cue(self) -> None:
+        """Short pleasant chime: assistant is listening for the command."""
+        try:
+            audio = self._make_listen_chime(SAMPLE_RATE) * self._assistant_gain()
+            sd.play(audio, SAMPLE_RATE, blocking=True)
+            # Let the room settle so the chime isn't captured as speech.
+            time.sleep(0.12)
+        except Exception:
+            logger.debug("Listen cue playback failed", exc_info=True)
 
     @staticmethod
-    def _download_file(url: str, dest: Path, *, attempts: int = 3) -> None:
-        """Stream download with timeout and retries (alphacephei often stalls on Pi)."""
-        timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
-        last_error: Exception | None = None
-        for attempt in range(1, attempts + 1):
-            try:
-                with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-                    with client.stream("GET", url) as response:
-                        response.raise_for_status()
-                        total = int(response.headers.get("content-length") or 0)
-                        done = 0
-                        last_log = 0
-                        with dest.open("wb") as out:
-                            for chunk in response.iter_bytes(chunk_size=256 * 1024):
-                                out.write(chunk)
-                                done += len(chunk)
-                                if total and done - last_log >= max(total // 10, 1):
-                                    logger.info(
-                                        "Vosk download: %.0f%% (%d / %d MB)",
-                                        100.0 * done / total,
-                                        done // (1024 * 1024),
-                                        total // (1024 * 1024),
-                                    )
-                                    last_log = done
-                if dest.stat().st_size < 1_000_000:
-                    raise RuntimeError(
-                        f"Downloaded file too small ({dest.stat().st_size} bytes)"
-                    )
-                return
-            except Exception as exc:
-                last_error = exc
-                logger.warning(
-                    "Download attempt %d/%d failed: %s", attempt, attempts, exc
-                )
-                dest.unlink(missing_ok=True)
-                time.sleep(min(5 * attempt, 15))
-        raise RuntimeError(
-            f"Download failed after {attempts} attempts"
-        ) from last_error
+    def _make_listen_chime(rate: int) -> np.ndarray:
+        """Soft two-tone 'listening' ding (~320ms), no external asset needed."""
+        def tone(freq: float, duration: float, amplitude: float = 0.22) -> np.ndarray:
+            n = max(1, int(rate * duration))
+            t = np.arange(n, dtype=np.float32) / float(rate)
+            # Soft attack/release envelope.
+            attack = min(n, int(rate * 0.02))
+            release = min(n, int(rate * 0.08))
+            env = np.ones(n, dtype=np.float32)
+            if attack > 0:
+                env[:attack] = np.linspace(0.0, 1.0, attack, dtype=np.float32)
+            if release > 0:
+                env[-release:] = np.linspace(1.0, 0.0, release, dtype=np.float32)
+            wave = np.sin(2.0 * np.pi * freq * t) * env * amplitude
+            # Light second harmonic for a less "beepy" timbre.
+            wave += np.sin(4.0 * np.pi * freq * t) * env * (amplitude * 0.18)
+            return wave.astype(np.float32)
+
+        gap = np.zeros(int(rate * 0.04), dtype=np.float32)
+        chime = np.concatenate(
+            [
+                tone(784.0, 0.11),   # G5
+                gap,
+                tone(1046.5, 0.16), # C6
+                np.zeros(int(rate * 0.05), dtype=np.float32),
+            ]
+        )
+        peak = float(np.max(np.abs(chime)) or 1.0)
+        if peak > 0.35:
+            chime *= 0.35 / peak
+        return chime
 
     def _start_music_poller(self) -> None:
         thread = threading.Thread(
@@ -964,13 +863,36 @@ class VoiceClient:
         """Linear gain for TTS / any sounddevice playback. 1→0.1 … 10→1.0."""
         return self._volume_to_percent(self._volume_level) / 100.0
 
+    def _is_music_playing(self) -> bool:
+        with self._music_lock:
+            proc = self._music_proc
+            return proc is not None and proc.poll() is None
+
+    def _duck_music(self, factor: float) -> None:
+        """Lower mpv only (not Pulse) so mic headroom returns while we listen."""
+        if not self._is_music_playing():
+            return
+        base = self._volume_to_percent(self._volume_level)
+        percent = max(5, min(100, int(round(base * max(0.05, factor)))))
+        self._apply_mpv_volume(percent)
+
+    def _restore_music_volume(self) -> None:
+        if not self._is_music_playing():
+            return
+        self._apply_mpv_volume(self._volume_to_percent(self._volume_level))
+
     def _set_volume(self, level: int) -> None:
         """Master volume for the whole assistant: TTS + music + Pulse sink."""
         level = max(1, min(10, int(level)))
         self._volume_level = level
         percent = self._volume_to_percent(level)
         logger.info("Assistant volume %s/10 (%s%%)", level, percent)
-        self._apply_mpv_volume(percent)
+        # Keep listen-duck while waiting for wake; otherwise a volume command
+        # would blast music back to full and bury the mic again.
+        if self._in_wake_listen and self._is_music_playing():
+            self._apply_mpv_volume(max(5, int(round(percent * MUSIC_LISTEN_DUCK))))
+        else:
+            self._apply_mpv_volume(percent)
         self._apply_pulse_volume(percent)
 
     def _apply_mpv_volume(self, percent: int) -> None:
@@ -1029,12 +951,17 @@ class VoiceClient:
             except Exception:
                 pass
             try:
+                # Start already ducked if we are in wake-listen — full blast would
+                # bury the mic until the next gate sync tick.
+                start_vol = percent
+                if self._in_wake_listen:
+                    start_vol = max(5, int(round(percent * MUSIC_LISTEN_DUCK)))
                 self._music_proc = subprocess.Popen(
                     [
                         self.mpv_command,
                         "--no-video",
                         "--really-quiet",
-                        f"--volume={percent}",
+                        f"--volume={start_vol}",
                         f"--input-ipc-server={ipc}",
                         stream_url,
                     ],
@@ -1149,6 +1076,20 @@ class VoiceClient:
 
             # Master assistant volume (1–10) applies to spoken replies too.
             data = data * self._assistant_gain()
+            # Trailing silence — ALSA underruns often clip the last syllable.
+            pad_n = int(rate * TTS_END_PAD_SEC)
+            if pad_n > 0:
+                if data.ndim == 1:
+                    data = np.concatenate(
+                        [data, np.zeros(pad_n, dtype=np.float32)]
+                    )
+                else:
+                    data = np.concatenate(
+                        [
+                            data,
+                            np.zeros((pad_n, data.shape[1]), dtype=np.float32),
+                        ]
+                    )
 
             if not self.barge_in:
                 sd.play(data, rate)
@@ -1180,17 +1121,16 @@ class VoiceClient:
         # Accept on the idle energy floor — the echo gate handles bleed separately.
         # Raising this with the speakers made high-volume barge-in impossible.
         threshold = self.energy_threshold
-        # Our own reply leaks into the mic — never treat it as a wake phrase.
-        echo_text = self._normalize(reply_text)
-        if self._wake_mode == "vosk":
-            return self._wait_vosk(
+        # Energy gate + OWW score replace Vosk echo-text filtering.
+        _ = reply_text
+        if self._wake_mode == "oww":
+            return self._wait_oww(
                 deadline=deadline,
                 energy_threshold=threshold,
-                echo_text=echo_text,
                 respect_cooldown=False,
                 echo_gate=True,
-                # Over the reply the phrase arrives once — waiting for a second
-                # matching frame usually means missing it.
+                # Over the reply the phrase arrives once — waiting for many
+                # matching frames usually means missing it.
                 stable_frames=1,
             )
         return None
@@ -1220,18 +1160,50 @@ class VoiceClient:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Raspberry Pi voice client for Open WebUI (Vosk + mpv)",
+        description="Raspberry Pi voice client for Open WebUI (openWakeWord + mpv)",
     )
     parser.add_argument(
         "--backend",
         default=os.getenv("VOICE_BACKEND_URL", "http://voice.pora-ai.ru"),
     )
     parser.add_argument(
-        "--wake",
-        default=os.getenv("WAKE_WORDS", "ассистент"),
-        help="Wake phrases (comma-separated). Default: ассистент",
+        "--oww-model",
+        default=os.getenv("OWW_MODEL", DEFAULT_OWW_MODEL),
+        help="openWakeWord pretrained name (default: alexa)",
     )
-    parser.add_argument("--silence", type=float, default=1.2)
+    parser.add_argument(
+        "--oww-threshold",
+        type=float,
+        default=float(os.getenv("OWW_THRESHOLD", str(DEFAULT_OWW_THRESHOLD))),
+        help="Wake score threshold 0–1 (default 0.5)",
+    )
+    parser.add_argument(
+        "--oww-framework",
+        default=os.getenv("OWW_FRAMEWORK", DEFAULT_OWW_FRAMEWORK),
+        help="Inference backend: onnx (default) or tflite",
+    )
+    parser.add_argument(
+        "--oww-vad",
+        type=float,
+        default=float(os.getenv("OWW_VAD_THRESHOLD", "0")),
+        help="Silero VAD gate for OWW (0=off, try 0.5 to cut false accepts)",
+    )
+    parser.add_argument(
+        "--oww-model-path",
+        default=os.getenv("OWW_MODEL_PATH", ""),
+        help="Optional path to a custom .onnx/.tflite wake model",
+    )
+    parser.add_argument(
+        "--wake",
+        default=os.getenv("WAKE_WORDS", ""),
+        help="Optional display label (detection uses OWW_MODEL)",
+    )
+    parser.add_argument(
+        "--silence",
+        type=float,
+        default=float(os.getenv("SILENCE_SEC", "1.8")),
+        help="Seconds of quiet before ending the command recording (default 1.8)",
+    )
     parser.add_argument("--max-sec", type=float, default=20.0)
     parser.add_argument(
         "--energy",
@@ -1240,27 +1212,16 @@ def main() -> None:
         help="Min RMS energy for wake / utterance start",
     )
     parser.add_argument(
-        "--wake-conf",
-        type=float,
-        default=float(os.getenv("WAKE_MIN_CONF", "0.55")),
-        help="Min Vosk word confidence when scores are present (finals)",
-    )
-    parser.add_argument(
         "--wake-stable",
         type=int,
         default=int(os.getenv("WAKE_STABLE_FRAMES", "2")),
-        help="Vosk: frames with wake prefix (~250ms) before accept",
+        help="OWW: consecutive 80ms frames above threshold before accept",
     )
     parser.add_argument(
         "--wake-cooldown",
         type=float,
         default=float(os.getenv("WAKE_COOLDOWN", "2.0")),
         help="Seconds to ignore wake after assist / previous wake",
-    )
-    parser.add_argument(
-        "--vosk-model",
-        default=os.getenv("VOSK_MODEL_PATH", ""),
-        help="Optional path to vosk-model-small-ru-0.22 (auto-download otherwise)",
     )
     parser.add_argument(
         "--no-barge-in",
@@ -1309,12 +1270,15 @@ def main() -> None:
 
     client = VoiceClient(
         backend_url=args.backend,
-        wake_words=wake_words,
+        wake_words=wake_words or None,
         silence_sec=args.silence,
         max_utterance_sec=args.max_sec,
         energy_threshold=args.energy,
-        vosk_model_path=args.vosk_model,
-        wake_min_conf=args.wake_conf,
+        oww_model=args.oww_model,
+        oww_threshold=args.oww_threshold,
+        oww_framework=args.oww_framework,
+        oww_vad_threshold=args.oww_vad,
+        oww_model_path=args.oww_model_path,
         wake_cooldown_sec=args.wake_cooldown,
         wake_stable_frames=args.wake_stable,
         barge_in=args.barge_in,

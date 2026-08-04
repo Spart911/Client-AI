@@ -24,7 +24,7 @@
 ## Что делает клиент (логика уже есть)
 
 ```
-Wake (Vosk, «ассистент»)
+Wake (openWakeWord «alexa»)
   → запись команды (sounddevice)
   → POST http://voice.pora-ai.ru/v1/assist  (+ device_id)
   → проиграть TTS (WAV из ответа)
@@ -38,7 +38,7 @@ Wake (Vosk, «ассистент»)
 
 | Файл | Статус |
 |------|--------|
-| `pi_assistant.py` | ✅ рабочая логика (Vosk + mpv, без openwakeword) |
+| `pi_assistant.py` | ✅ openWakeWord (alexa) + mpv |
 | `requirements.txt` | ✅ лёгкие deps |
 | `install.sh` / `voice-client.service` | ⚠️ venv/systemd — заменить на Docker |
 | `README.md` | обновить под новый repo |
@@ -66,9 +66,9 @@ Wake (Vosk, «ассистент»)
 ### Что НЕ делать
 
 - ❌ Не клонировать `OpenWebUI` целиком на Pi  
-- ❌ Не ставить `openwakeword` / `onnxruntime` (тяжело для Pi 3B)  
 - ❌ Не тащить backend STT/TTS на Pi  
-- ❌ Не делать Watchtower как единственный путь, если образы не публикуются — приоритет **git pull на Pi**
+- ❌ Не делать Watchtower как единственный путь, если образы не публикуются — приоритет **git pull на Pi**  
+- ⚠️ Wake: openWakeWord + onnxruntime (тяжёлее Vosk по RAM — следить на Pi 3B 1 GB)
 
 ---
 
@@ -95,7 +95,7 @@ Wake (Vosk, «ассистент»)
 
 - Мало RAM: образ держать **slim**, один сервис  
 - Платформа: `linux/arm/v7` (32-bit) или `linux/arm64` (если 64-bit OS)  
-- Prefetch Vosk-модели при build **или** volume-кэш `~/.cache/vosk`, чтобы не качать каждый раз  
+- Prefetch openWakeWord models at Docker build (`openwakeword.utils.download_models()`)  
 - `restart: unless-stopped`  
 
 ### Git auto-update
@@ -155,7 +155,7 @@ Wake (Vosk, «ассистент»)
 git clone <repo> ~/voice-client-pi
 cd ~/voice-client-pi && cp .env.example .env   # править BACKEND / DEVICE_ID
 bash install.sh
-# «ассистент, включи кадилак» → звук с колонки Pi
+# «alexa, включи кадилак» → звук с колонки Pi
 # push в git → через timer контейнер обновляется сам
 ```
 
