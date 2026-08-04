@@ -6,11 +6,17 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    # Keep ALSA for USB mic/speakers; Pulse covers Bluetooth on the host.
     devices:
       - /dev/snd:/dev/snd
     group_add:
-      # Typical Debian/RPi OS audio GID; check with: getent group audio
       - "29"
     environment:
       HOME: /home/pi
       VOSK_MODEL_PATH: /opt/vosk/vosk-model-small-ru-0.22
+      PULSE_SERVER: unix:/run/user/1000/pulse/native
+      XDG_RUNTIME_DIR: /run/user/1000
+    volumes:
+      # Host PulseAudio (Bluetooth A2DP/HFP lives here)
+      - /run/user/1000/pulse:/run/user/1000/pulse
+      - /home/server-pi/.config/pulse/cookie:/home/pi/.config/pulse/cookie:ro

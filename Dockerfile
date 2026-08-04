@@ -7,7 +7,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     # piwheels: prebuilt wheels for armv7 (Pi 3B 32-bit) — avoids compiling numpy/cffi
     PIP_EXTRA_INDEX_URL=https://www.piwheels.org/simple \
     HOME=/home/pi \
-    VOSK_MODEL_PATH=/opt/vosk/vosk-model-small-ru-0.22
+    VOSK_MODEL_PATH=/opt/vosk/vosk-model-small-ru-0.22 \
+    PULSE_SERVER=unix:/run/user/1000/pulse/native \
+    XDG_RUNTIME_DIR=/run/user/1000
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       portaudio19-dev \
@@ -18,6 +20,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libgfortran5 \
       mpv \
       alsa-utils \
+      libasound2-plugins \
+      libpulse0 \
+      pulseaudio-utils \
       ca-certificates \
       unzip \
       gcc \
@@ -39,6 +44,7 @@ RUN mkdir -p /opt/vosk \
     && unzip -q /tmp/vosk.zip -d /opt/vosk \
     && rm -f /tmp/vosk.zip
 
+COPY asound.conf /etc/asound.conf
 COPY pi_assistant.py .
 RUN chown -R pi:pi /home/pi /app
 
