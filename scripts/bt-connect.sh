@@ -136,6 +136,11 @@ apply_pulse() {
   if [[ -n "${source}" ]]; then
     log "default source → ${source}"
     pactl set-default-source "${source}" || true
+    mic_vol="${BT_MIC_VOLUME:-200%}"
+    if [[ -n "${mic_vol}" ]]; then
+      log "source volume → ${mic_vol}"
+      pactl set-source-volume "${source}" "${mic_vol}" || true
+    fi
   elif [[ "${PROFILE}" == "a2dp_sink" ]]; then
     log "A2DP has no mic — keep existing default source"
   fi

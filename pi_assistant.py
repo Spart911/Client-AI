@@ -65,7 +65,8 @@ MUSIC_SPEECH_DUCK = 0.12
 MUSIC_GATE_MULT = 1.08
 
 DEFAULT_OWW_MODEL = "alexa"
-DEFAULT_OWW_THRESHOLD = 0.5
+# HFP Bluetooth mics are quiet/noisy — 0.5 is too strict at room distance.
+DEFAULT_OWW_THRESHOLD = 0.35
 # tflite works on Pi 3B 32-bit; onnxruntime usually needs arm64/x86_64.
 DEFAULT_OWW_FRAMEWORK = "tflite"
 
@@ -86,7 +87,7 @@ class VoiceClient:
         oww_vad_threshold: float = 0.0,
         oww_model_path: str = "",
         wake_cooldown_sec: float = 2.0,
-        wake_stable_frames: int = 2,
+        wake_stable_frames: int = 1,
         barge_in: bool = True,
         barge_energy_mult: float = 1.12,
         device_id: str = "default",
@@ -302,11 +303,23 @@ class VoiceClient:
             last_error: Exception | None = None
             for framework in frameworks:
                 try:
-                    self._oww = Model(
-                        wakeword_models=[wake_ref],
-                        inference_framework=framework,
-                        vad_threshold=self.oww_vad_threshold,
-                    )
+                    try:
+                        self._oww = Model(
+                            wakeword_models=[wake_ref],
+                            inference_framework=framework,
+                            vad_threshold=self.oww_vad_threshold,
+                            enable_speex_noise_suppression=True,
+                        )
+                    except Exception as speex_exc:
+                        logger.warning(
+                            "OWW speex NS unavailable (%s) — retry without it",
+                            speex_exc,
+                        )
+                        self._oww = Model(
+                            wakeword_models=[wake_ref],
+                            inference_framework=framework,
+                            vad_threshold=self.oww_vad_threshold,
+                        )
                     self.oww_framework = framework
                     break
                 except Exception as exc:
@@ -582,11 +595,11 @@ class VoiceClient:
                         )
                         last_score_log = best_score
 
-                    # HFP Bluetooth mics are quiet — don't require full WAKE_ENERGY.
-                    # Strong OWW scores alone are enough (mic may look near-silent).
+                    # HFP Bluetooth mics are quiet — if OWW is confident, accept
+                    # even when RMS looks near silence.
                     energy_ok = (
-                        frame_energy >= min(threshold * 0.5, 0.002)
-                        or best_score >= max(0.85, score_limit)
+                        frame_energy >= min(threshold * 0.35, 0.001)
+                        or best_score >= score_limit
                     )
                     if best_score >= score_limit and energy_ok:
                         stable += 1
@@ -1249,13 +1262,13 @@ def main() -> None:
     parser.add_argument(
         "--energy",
         type=float,
-        default=float(os.getenv("WAKE_ENERGY", "0.01")),
-        help="Min RMS energy for wake / utterance start",
+        default=float(os.getenv("WAKE_ENERGY", "0.002")),
+        help="Min RMS energy for wake / utterance start (HFP mics: try 0.001–0.002)",
     )
     parser.add_argument(
         "--wake-stable",
         type=int,
-        default=int(os.getenv("WAKE_STABLE_FRAMES", "2")),
+        default=int(os.getenv("WAKE_STABLE_FRAMES", "1")),
         help="OWW: consecutive 80ms frames above threshold before accept",
     )
     parser.add_argument(
