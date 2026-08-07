@@ -1,0 +1,17 @@
+{
+  "type": "micro",
+  "wake_word": "Джарвис",
+  "author": "kelstar",
+  "model": "ru_jarvis_mww.tflite",
+  "trained_languages": [
+    "ru"
+  ],
+  "version": 2,
+  "micro": {
+    "probability_cutoff": 0.9,
+    "sliding_window_size": 10,
+    "feature_step_size": 10,
+    "tensor_arena_size": 20000,
+    "minimum_esphome_version": "2024.2.0"
+  }
+}

@@ -1,6 +1,6 @@
 # voice-client-pi
 
-Голосовой клиент для Raspberry Pi: wake (**openWakeWord «alexa»**) → запись → backend → TTS + mpv (Яндекс Музыка).
+Голосовой клиент для Raspberry Pi: wake (**openWakeWord** или **microWakeWord**) → запись → backend → TTS + mpv (Яндекс Музыка).
 
 Запуск в **Docker**, автообновление через **git pull** + rebuild. На Pi клонируется только этот репозиторий.
 
@@ -33,9 +33,11 @@ DEVICE_ID=pi-livingroom BACKEND=http://voice.pora-ai.ru bash install.sh
 |------------|--------|------------|
 | `VOICE_BACKEND_URL` | `http://voice.pora-ai.ru` | Backend assist API |
 | `MUSIC_DEVICE_ID` | `pi-livingroom` | ID устройства (как в Open WebUI music tool) |
+| `WAKE_ENGINE` | `oww` | `oww` (openWakeWord) или `mww` (microWakeWord) |
 | `OWW_MODEL` | `alexa` | Pretrained openWakeWord (`alexa`, `hey jarvis`, …) |
-| `OWW_THRESHOLD` | `0.5` | Порог score 0–1 (ниже = чувствительнее) |
-| `OWW_FRAMEWORK` | `onnx` | `onnx` или `tflite` |
+| `OWW_THRESHOLD` | `0.35` | Порог score 0–1 (ниже = чувствительнее) |
+| `OWW_FRAMEWORK` | `tflite` | `onnx` или `tflite` |
+| `MWW_MODEL_CONFIG` | `/app/models/ru_jarvis_mww.json` | Конфиг модели из `interkelstar/microwakeword-trainer` |
 | `MUSIC_POLL` | `true` | Фоновый poll `/v1/music/pending` |
 
 `.env` не коммитится.
@@ -108,7 +110,7 @@ speaker-test -t wav -c 2
 
 | Путь | Роль |
 |------|------|
-| `pi_assistant.py` | Клиент (openWakeWord + sounddevice + mpv) |
+| `pi_assistant.py` | Клиент (openWakeWord/microWakeWord + sounddevice + mpv) |
 | `Dockerfile` / `docker-compose.yml` | Образ и запуск |
 
-Wake раньше был на Vosk («ассистент»). Сейчас always-on — только OWW; STT по-прежнему на backend.
+Wake раньше был на Vosk («ассистент»). Сейчас always-on — OWW или MWW; STT по-прежнему на backend.

@@ -1,9 +1,11 @@
 """
-Raspberry Pi voice client: openWakeWord («alexa») → record → backend → play.
+Raspberry Pi voice client: wake word → record → backend → play.
 
-Wake uses openWakeWord + onnxruntime (no always-on Vosk). STT/LLM/TTS stay
-on the backend. Barge-in: OWW also watches while TTS plays so saying
-«alexa …» cuts playback short and records the new command.
+Supports two wake engines:
+- openWakeWord (OWW): pretrained/custom OWW heads (default)
+- microWakeWord (MWW): custom .json + .tflite from microwakeword-trainer
+
+STT/LLM/TTS stay on the backend.
 """
 
 from __future__ import annotations
@@ -69,6 +71,7 @@ DEFAULT_OWW_MODEL = "alexa"
 DEFAULT_OWW_THRESHOLD = 0.35
 # tflite works on Pi 3B 32-bit; onnxruntime usually needs arm64/x86_64.
 DEFAULT_OWW_FRAMEWORK = "tflite"
+DEFAULT_WAKE_ENGINE = "oww"
 
 
 class VoiceClient:
@@ -81,11 +84,13 @@ class VoiceClient:
         silence_sec: float = 1.8,
         max_utterance_sec: float = 20.0,
         energy_threshold: float = 0.01,
+        wake_engine: str = DEFAULT_WAKE_ENGINE,
         oww_model: str = DEFAULT_OWW_MODEL,
         oww_threshold: float = DEFAULT_OWW_THRESHOLD,
         oww_framework: str = DEFAULT_OWW_FRAMEWORK,
         oww_vad_threshold: float = 0.0,
         oww_model_path: str = "",
+        mww_model_config: str = "",
         wake_cooldown_sec: float = 2.0,
         wake_stable_frames: int = 1,
         barge_in: bool = True,
@@ -102,6 +107,9 @@ class VoiceClient:
         self.music_poll_interval = max(0.5, music_poll_interval)
         self.mpv_command = (mpv_command or "").strip() or shutil.which("mpv") or "mpv"
         self.audio_device = audio_device
+        self.wake_engine = (wake_engine or DEFAULT_WAKE_ENGINE).strip().lower()
+        if self.wake_engine not in ("oww", "mww"):
+            self.wake_engine = DEFAULT_WAKE_ENGINE
         # Display / logging only — detection is the OWW model (default alexa).
         label = (oww_model or DEFAULT_OWW_MODEL).strip() or DEFAULT_OWW_MODEL
         if wake_words:
@@ -116,6 +124,7 @@ class VoiceClient:
             self.oww_framework = DEFAULT_OWW_FRAMEWORK
         self.oww_vad_threshold = max(0.0, float(oww_vad_threshold))
         self.oww_model_path = (oww_model_path or "").strip()
+        self.mww_model_config = (mww_model_config or "").strip()
         self.silence_sec = silence_sec
         self.max_utterance_sec = max_utterance_sec
         self.energy_threshold = energy_threshold
@@ -134,6 +143,9 @@ class VoiceClient:
             )
         self._oww = None
         self._oww_labels: list[str] = []
+        self._mww = None
+        self._mww_features = None
+        self._mww_wake_word = ""
         self._wake_mode = "none"
         self._last_wake_ts = 0.0
         self._music_proc: subprocess.Popen | None = None
@@ -148,7 +160,12 @@ class VoiceClient:
     def run(self) -> None:
         logger.info("Backend: %s", self.backend_url)
         logger.info("Device id: %s", self.device_id)
-        logger.info("Wake model: %s (threshold=%.2f)", self.oww_model, self.oww_threshold)
+        logger.info(
+            "Wake engine=%s model=%s threshold=%.2f",
+            self.wake_engine,
+            self.oww_model,
+            self.oww_threshold,
+        )
         self._configure_audio_device()
         self._warmup_backend()
         self._init_wake()
@@ -278,7 +295,48 @@ class VoiceClient:
             sys.exit(1)
 
     def _init_wake(self) -> None:
-        self._init_oww()
+        if self.wake_engine == "mww":
+            self._init_mww()
+        else:
+            self._init_oww()
+
+    def _init_mww(self) -> None:
+        try:
+            from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures
+        except Exception as exc:
+            logger.error(
+                "microWakeWord import failed (%s). Install: pip install pymicro-wakeword",
+                exc,
+            )
+            sys.exit(1)
+
+        if not self.mww_model_config:
+            logger.error(
+                "MWW_MODEL_CONFIG is empty. Set path to *_mww.json from microwakeword-trainer."
+            )
+            sys.exit(1)
+
+        config_path = Path(self.mww_model_config)
+        if not config_path.is_file():
+            logger.error("MWW model config not found: %s", config_path)
+            sys.exit(1)
+
+        try:
+            self._mww = MicroWakeWord.from_config(config_path)
+            self._mww_features = MicroWakeWordFeatures()
+            self._mww_wake_word = getattr(self._mww, "wake_word", "mww")
+            # If threshold is explicit in env/CLI, override trainer default.
+            self._mww.probability_cutoff = self.oww_threshold
+            self._wake_mode = "mww"
+            logger.info(
+                "microWakeWord ready: wake=%s cutoff=%.2f config=%s",
+                self._mww_wake_word,
+                self._mww.probability_cutoff,
+                config_path,
+            )
+        except Exception as exc:
+            logger.error("microWakeWord init failed: %s", exc)
+            sys.exit(1)
 
     def _init_oww(self) -> None:
         try:
@@ -344,6 +402,15 @@ class VoiceClient:
             sys.exit(1)
 
     def _wait_for_wake(self) -> np.ndarray | None:
+        if self._wake_mode == "mww":
+            self._in_wake_listen = True
+            try:
+                return self._wait_mww(
+                    echo_gate=self._is_music_playing(),
+                    music_duck=True,
+                )
+            finally:
+                self._in_wake_listen = False
         if self._wake_mode == "oww":
             self._in_wake_listen = True
             try:
@@ -354,6 +421,205 @@ class VoiceClient:
             finally:
                 self._in_wake_listen = False
         raise RuntimeError("Wake engine is not initialized")
+
+    def _wait_mww(
+        self,
+        *,
+        deadline: float | None = None,
+        energy_threshold: float | None = None,
+        respect_cooldown: bool = True,
+        echo_gate: bool = False,
+        stable_frames: int | None = None,
+        music_duck: bool = False,
+    ) -> np.ndarray | None:
+        from collections import deque
+
+        assert self._mww is not None
+        assert self._mww_features is not None
+        threshold = self.energy_threshold if energy_threshold is None else energy_threshold
+        stable_needed = (
+            self.wake_stable_frames if stable_frames is None else max(1, stable_frames)
+        )
+        score_limit = float(self._mww.probability_cutoff)
+
+        block = OWW_FRAME_SAMPLES
+        q: queue.Queue[np.ndarray] = queue.Queue()
+        stable = 0
+        use_gate = bool(echo_gate)
+        music_mode = False
+        speech_ducked = False
+        preroll: deque[np.ndarray] = deque(maxlen=4 if use_gate else 20)
+        floor_window: deque[float] = deque(maxlen=16)
+        pre_burst_f: deque[np.ndarray] = deque(maxlen=BARGE_ONSET_FRAMES)
+        feeding = False
+        quiet_frames = 0
+        gate_logged = False
+        last_heartbeat = 0.0
+        peak_energy = 0.0
+        peak_score = 0.0
+        frames_seen = 0
+
+        def callback(indata, frames, time_info, status) -> None:  # noqa: ARG001
+            if status:
+                logger.warning("mic status: %s", status)
+            q.put(indata.copy())
+
+        def sync_music_duck() -> None:
+            nonlocal use_gate, music_mode, speech_ducked, preroll
+            nonlocal stable, feeding, quiet_frames
+            if not music_duck:
+                return
+            playing = self._is_music_playing()
+            if playing and not music_mode:
+                music_mode = True
+                use_gate = True
+                preroll = deque(preroll, maxlen=4)
+                floor_window.clear()
+                pre_burst_f.clear()
+                feeding = False
+                quiet_frames = 0
+                speech_ducked = False
+                stable = 0
+                self._mww.reset()
+                self._mww_features.reset()
+                self._duck_music(MUSIC_LISTEN_DUCK)
+            elif not playing and music_mode:
+                music_mode = False
+                speech_ducked = False
+                if not echo_gate:
+                    use_gate = False
+                    preroll = deque(preroll, maxlen=20)
+
+        def set_feeding(active: bool) -> None:
+            nonlocal feeding, quiet_frames, speech_ducked, stable
+            if active == feeding:
+                return
+            feeding = active
+            quiet_frames = 0
+            if active:
+                self._mww.reset()
+                self._mww_features.reset()
+                stable = 0
+            if not music_mode:
+                return
+            if active:
+                self._duck_music(MUSIC_SPEECH_DUCK)
+                speech_ducked = True
+            elif speech_ducked:
+                self._duck_music(MUSIC_LISTEN_DUCK)
+                speech_ducked = False
+
+        logger.info(
+            "Listening for microWakeWord %s (score≥%.2f, stable≥%d)",
+            self._mww_wake_word or "mww",
+            score_limit,
+            stable_needed,
+        )
+
+        try:
+            self._mww.reset()
+            self._mww_features.reset()
+            sync_music_duck()
+            with sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+                blocksize=block,
+                callback=callback,
+            ):
+                while True:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return None
+                    sync_music_duck()
+                    try:
+                        chunk = q.get(timeout=0.25)
+                    except queue.Empty:
+                        continue
+                    mono = chunk.reshape(-1).astype(np.int16, copy=False)
+                    frame_f = mono.astype(np.float32) / 32768.0
+                    frame_energy = self._rms(frame_f)
+                    frames_seen += 1
+                    peak_energy = max(peak_energy, frame_energy)
+
+                    if use_gate:
+                        gate_mult = MUSIC_GATE_MULT if music_mode else self.barge_energy_mult
+                        gate = self._echo_gate(floor_window, threshold, mult=gate_mult)
+                        loud = gate is not None and frame_energy >= gate
+                        if not loud and not feeding:
+                            floor_window.append(frame_energy)
+                        if loud:
+                            quiet_frames = 0
+                            if not feeding:
+                                set_feeding(True)
+                                for onset in pre_burst_f:
+                                    preroll.append(onset)
+                                pre_burst_f.clear()
+                                if not gate_logged:
+                                    logger.info(
+                                        "Speech gate %.3f — heard %.3f over playback",
+                                        gate,
+                                        frame_energy,
+                                    )
+                                    gate_logged = True
+                        elif feeding:
+                            quiet_frames += 1
+                            if quiet_frames > BARGE_HANGOVER_FRAMES:
+                                set_feeding(False)
+                                stable = 0
+                        if not feeding:
+                            pre_burst_f.append(frame_f.copy())
+                            continue
+                        preroll.append(frame_f.copy())
+                    else:
+                        preroll.append(frame_f.copy())
+
+                    if (
+                        respect_cooldown
+                        and time.monotonic() - self._last_wake_ts < self.wake_cooldown_sec
+                    ):
+                        # Keep streaming state warm while cooldown is active.
+                        for feat in self._mww_features.process_streaming(mono.tobytes()):
+                            _ = self._mww.process_streaming_prob(feat)
+                        stable = 0
+                        continue
+
+                    best_score = 0.0
+                    for feat in self._mww_features.process_streaming(mono.tobytes()):
+                        prob = self._mww.process_streaming_prob(feat)
+                        if prob is None:
+                            continue
+                        best_score = max(best_score, float(prob))
+                    peak_score = max(peak_score, best_score)
+
+                    now = time.monotonic()
+                    if now - last_heartbeat >= 5.0:
+                        logger.info(
+                            "Mic heartbeat: rms=%.5f peak_rms=%.5f mww=%.3f peak_score=%.3f frames=%d",
+                            frame_energy,
+                            peak_energy,
+                            best_score,
+                            peak_score,
+                            frames_seen,
+                        )
+                        last_heartbeat = now
+                        peak_energy = 0.0
+
+                    if best_score >= score_limit:
+                        stable += 1
+                    else:
+                        stable = 0
+
+                    if stable >= stable_needed:
+                        logger.info(
+                            "Wake matched (mww): %s score=%.3f energy=%.3f",
+                            self._mww_wake_word or "mww",
+                            best_score,
+                            frame_energy,
+                        )
+                        return self._preroll_array(preroll)
+        finally:
+            if music_duck and music_mode:
+                self._restore_music_volume()
 
     def _wait_oww(
         self,
@@ -1177,6 +1443,14 @@ class VoiceClient:
         threshold = self.energy_threshold
         # Energy gate + OWW score replace Vosk echo-text filtering.
         _ = reply_text
+        if self._wake_mode == "mww":
+            return self._wait_mww(
+                deadline=deadline,
+                energy_threshold=threshold,
+                respect_cooldown=False,
+                echo_gate=True,
+                stable_frames=1,
+            )
         if self._wake_mode == "oww":
             return self._wait_oww(
                 deadline=deadline,
@@ -1214,11 +1488,16 @@ class VoiceClient:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Raspberry Pi voice client for Open WebUI (openWakeWord + mpv)",
+        description="Raspberry Pi voice client for Open WebUI (OWW/MWW + mpv)",
     )
     parser.add_argument(
         "--backend",
         default=os.getenv("VOICE_BACKEND_URL", "http://voice.pora-ai.ru"),
+    )
+    parser.add_argument(
+        "--wake-engine",
+        default=os.getenv("WAKE_ENGINE", DEFAULT_WAKE_ENGINE),
+        help="Wake engine: oww (openWakeWord) or mww (microWakeWord)",
     )
     parser.add_argument(
         "--oww-model",
@@ -1229,12 +1508,12 @@ def main() -> None:
         "--oww-threshold",
         type=float,
         default=float(os.getenv("OWW_THRESHOLD", str(DEFAULT_OWW_THRESHOLD))),
-        help="Wake score threshold 0–1 (default 0.5)",
+        help="Wake score threshold 0–1 (default 0.35)",
     )
     parser.add_argument(
         "--oww-framework",
         default=os.getenv("OWW_FRAMEWORK", DEFAULT_OWW_FRAMEWORK),
-        help="Inference backend: onnx (default) or tflite",
+        help="Inference backend: onnx or tflite (default tflite)",
     )
     parser.add_argument(
         "--oww-vad",
@@ -1246,6 +1525,11 @@ def main() -> None:
         "--oww-model-path",
         default=os.getenv("OWW_MODEL_PATH", ""),
         help="Optional path to a custom .onnx/.tflite wake model",
+    )
+    parser.add_argument(
+        "--mww-model-config",
+        default=os.getenv("MWW_MODEL_CONFIG", ""),
+        help="Path to *_mww.json from microwakeword-trainer",
     )
     parser.add_argument(
         "--wake",
@@ -1328,11 +1612,13 @@ def main() -> None:
         silence_sec=args.silence,
         max_utterance_sec=args.max_sec,
         energy_threshold=args.energy,
+        wake_engine=args.wake_engine,
         oww_model=args.oww_model,
         oww_threshold=args.oww_threshold,
         oww_framework=args.oww_framework,
         oww_vad_threshold=args.oww_vad,
         oww_model_path=args.oww_model_path,
+        mww_model_config=args.mww_model_config,
         wake_cooldown_sec=args.wake_cooldown,
         wake_stable_frames=args.wake_stable,
         barge_in=args.barge_in,

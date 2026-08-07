@@ -44,6 +44,7 @@ RUN chmod +x /tmp/install-oww-runtime.sh \
 
 COPY asound.conf /etc/asound.conf
 COPY pi_assistant.py .
+COPY models ./models
 RUN chown -R pi:pi /home/pi /app
 
 USER pi
