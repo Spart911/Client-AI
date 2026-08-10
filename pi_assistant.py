@@ -191,7 +191,12 @@ class VoiceClient:
             self._stop_music()
             self._last_wake_ts = time.monotonic()
             logger.info("Wake detected — capturing command")
-            self._play_listen_cue()
+            # One-shot «Джарвис какая погода»: command already trails the wake
+            # in preroll — skip the chime so we don't eat the utterance.
+            if self._preroll_still_speaking(preroll):
+                logger.info("Speech already in preroll — skip listen cue")
+            else:
+                self._play_listen_cue()
             interrupted = False
             while True:
                 wav_bytes = self._record_until_silence(
@@ -203,6 +208,7 @@ class VoiceClient:
                     if not interrupted:
                         logger.warning("Empty recording, back to wake listen")
                     break
+                self._play_sent_cue()
                 # Non-None preroll means the user interrupted the reply.
                 preroll = self._assist_and_play(wav_bytes)
                 self._last_wake_ts = time.monotonic()
@@ -448,7 +454,8 @@ class VoiceClient:
         use_gate = bool(echo_gate)
         music_mode = False
         speech_ducked = False
-        preroll: deque[np.ndarray] = deque(maxlen=4 if use_gate else 20)
+        # Idle: keep ~2.8s so «Джарвис какая погода» keeps the command tail.
+        preroll: deque[np.ndarray] = deque(maxlen=4 if use_gate else 35)
         floor_window: deque[float] = deque(maxlen=16)
         pre_burst_f: deque[np.ndarray] = deque(maxlen=BARGE_ONSET_FRAMES)
         feeding = False
@@ -488,7 +495,7 @@ class VoiceClient:
                 speech_ducked = False
                 if not echo_gate:
                     use_gate = False
-                    preroll = deque(preroll, maxlen=20)
+                    preroll = deque(preroll, maxlen=35)
 
         def set_feeding(active: bool) -> None:
             nonlocal feeding, quiet_frames, speech_ducked, stable
@@ -656,7 +663,8 @@ class VoiceClient:
         music_mode = False
         speech_ducked = False
         # ~1.5 s of float audio after wake for a trailing command fragment.
-        preroll: deque[np.ndarray] = deque(maxlen=4 if use_gate else 20)
+        # Idle: keep ~2.8s so «Джарвис какая погода» keeps the command tail.
+        preroll: deque[np.ndarray] = deque(maxlen=4 if use_gate else 35)
         floor_window: deque[float] = deque(maxlen=16)
         pre_burst_f: deque[np.ndarray] = deque(maxlen=BARGE_ONSET_FRAMES)
         feeding = False
@@ -700,7 +708,7 @@ class VoiceClient:
                 speech_ducked = False
                 if not echo_gate:
                     use_gate = False
-                    preroll = deque(preroll, maxlen=20)
+                    preroll = deque(preroll, maxlen=35)
 
         def set_feeding(active: bool) -> None:
             nonlocal feeding, quiet_frames, speech_ducked, stable
@@ -889,6 +897,13 @@ class VoiceClient:
             return None
         return np.concatenate(list(preroll))
 
+    def _preroll_still_speaking(self, preroll: np.ndarray | None) -> bool:
+        """True if the wake preroll's tail still looks like live speech."""
+        if preroll is None or preroll.size < int(SAMPLE_RATE * 0.12):
+            return False
+        tail = preroll[-int(SAMPLE_RATE * 0.3) :]
+        return self._rms(tail) >= max(self.energy_threshold * 0.35, 0.0008)
+
     def _echo_gate(
         self,
         window,
@@ -1069,13 +1084,20 @@ class VoiceClient:
         except Exception:
             logger.debug("Listen cue playback failed", exc_info=True)
 
+    def _play_sent_cue(self) -> None:
+        """Different chime: listening finished, request is being sent."""
+        try:
+            audio = self._make_sent_chime(SAMPLE_RATE) * self._assistant_gain()
+            sd.play(audio, SAMPLE_RATE, blocking=True)
+        except Exception:
+            logger.debug("Sent cue playback failed", exc_info=True)
+
     @staticmethod
     def _make_listen_chime(rate: int) -> np.ndarray:
-        """Soft two-tone 'listening' ding (~320ms), no external asset needed."""
+        """Soft two-tone 'listening' ding (~320ms), ascending."""
         def tone(freq: float, duration: float, amplitude: float = 0.22) -> np.ndarray:
             n = max(1, int(rate * duration))
             t = np.arange(n, dtype=np.float32) / float(rate)
-            # Soft attack/release envelope.
             attack = min(n, int(rate * 0.02))
             release = min(n, int(rate * 0.08))
             env = np.ones(n, dtype=np.float32)
@@ -1084,7 +1106,6 @@ class VoiceClient:
             if release > 0:
                 env[-release:] = np.linspace(1.0, 0.0, release, dtype=np.float32)
             wave = np.sin(2.0 * np.pi * freq * t) * env * amplitude
-            # Light second harmonic for a less "beepy" timbre.
             wave += np.sin(4.0 * np.pi * freq * t) * env * (amplitude * 0.18)
             return wave.astype(np.float32)
 
@@ -1100,6 +1121,37 @@ class VoiceClient:
         peak = float(np.max(np.abs(chime)) or 1.0)
         if peak > 0.35:
             chime *= 0.35 / peak
+        return chime
+
+    @staticmethod
+    def _make_sent_chime(rate: int) -> np.ndarray:
+        """Soft two-tone 'sent' ding (~280ms), descending — distinct from listen."""
+        def tone(freq: float, duration: float, amplitude: float = 0.20) -> np.ndarray:
+            n = max(1, int(rate * duration))
+            t = np.arange(n, dtype=np.float32) / float(rate)
+            attack = min(n, int(rate * 0.015))
+            release = min(n, int(rate * 0.07))
+            env = np.ones(n, dtype=np.float32)
+            if attack > 0:
+                env[:attack] = np.linspace(0.0, 1.0, attack, dtype=np.float32)
+            if release > 0:
+                env[-release:] = np.linspace(1.0, 0.0, release, dtype=np.float32)
+            wave = np.sin(2.0 * np.pi * freq * t) * env * amplitude
+            wave += np.sin(4.0 * np.pi * freq * t) * env * (amplitude * 0.12)
+            return wave.astype(np.float32)
+
+        gap = np.zeros(int(rate * 0.03), dtype=np.float32)
+        chime = np.concatenate(
+            [
+                tone(880.0, 0.09),  # A5
+                gap,
+                tone(659.3, 0.14),  # E5 — lower confirmation
+                np.zeros(int(rate * 0.04), dtype=np.float32),
+            ]
+        )
+        peak = float(np.max(np.abs(chime)) or 1.0)
+        if peak > 0.32:
+            chime *= 0.32 / peak
         return chime
 
     def _start_music_poller(self) -> None:
