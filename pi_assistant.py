@@ -462,6 +462,7 @@ class VoiceClient:
         quiet_frames = 0
         gate_logged = False
         last_heartbeat = 0.0
+        last_score_log = 0.0
         peak_energy = 0.0
         peak_score = 0.0
         frames_seen = 0
@@ -599,6 +600,17 @@ class VoiceClient:
                     peak_score = max(peak_score, best_score)
 
                     now = time.monotonic()
+                    if best_score >= max(0.12, score_limit * 0.25) and (
+                        abs(best_score - last_score_log) >= 0.05
+                    ):
+                        logger.info(
+                            "MWW score %.3f energy=%.4f (need ≥%.2f)",
+                            best_score,
+                            frame_energy,
+                            score_limit,
+                        )
+                        last_score_log = best_score
+
                     if now - last_heartbeat >= 5.0:
                         logger.info(
                             "Mic heartbeat: rms=%.5f peak_rms=%.5f mww=%.3f peak_score=%.3f frames=%d",
@@ -610,6 +622,7 @@ class VoiceClient:
                         )
                         last_heartbeat = now
                         peak_energy = 0.0
+                        peak_score = 0.0
 
                     if best_score >= score_limit:
                         stable += 1
