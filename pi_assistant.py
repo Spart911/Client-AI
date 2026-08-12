@@ -965,30 +965,49 @@ class VoiceClient:
                 "return_audio": "true",
                 "device_id": self.device_id,
             }
-            response = self._http.post(
+            # Stream so we can split server wait (TTFB) from body download.
+            with self._http.stream(
+                "POST",
                 f"{self.backend_url}/v1/assist",
                 files=files,
                 data=data,
                 timeout=300.0,
-            )
-            t_http = time.monotonic()
-            if response.status_code >= 400:
-                logger.error(
-                    "Assist failed: %s %s",
-                    response.status_code,
-                    response.text,
-                )
-                return None
+            ) as response:
+                t_headers = time.monotonic()
+                if response.status_code >= 400:
+                    err_body = response.read()
+                    logger.error(
+                        "Assist failed: %s %s",
+                        response.status_code,
+                        err_body[:500],
+                    )
+                    return None
+                content_type = response.headers.get("content-type") or ""
+                headers = dict(response.headers)
+                body = response.read()
+                t_body = time.monotonic()
 
-            body_len = len(response.content)
-            transcript, reply, audio, playback = self._parse_assist_response(response)
+            body_len = len(body)
+            transcript, reply, audio, playback = self._parse_assist_body(
+                body,
+                content_type=content_type,
+                headers=headers,
+            )
             t_parse = time.monotonic()
+            ttfb = t_headers - t0
+            download = t_body - t_headers
+            parse = t_parse - t_body
+            kbps = (body_len / 1024.0 / download) if download > 0.01 else 0.0
             logger.info(
-                "Assist timing: http=%.1fs parse=%.1fs body=%dB audio=%dB",
-                t_http - t0,
-                t_parse - t_http,
+                "Assist timing: ttfb=%.1fs download=%.1fs (%.0f KiB/s) "
+                "parse=%.1fs body=%dB audio=%dB reply_chars=%d",
+                ttfb,
+                download,
+                kbps,
+                parse,
                 body_len,
                 len(audio),
+                len(reply),
             )
             if transcript:
                 logger.info("You: %s", transcript)
@@ -1009,18 +1028,16 @@ class VoiceClient:
         finally:
             self.music_poll = music_was
 
-    def _parse_assist_response(
+    def _parse_assist_body(
         self,
-        response: httpx.Response,
+        body: bytes,
+        content_type: str,
+        headers: dict[str, str],
     ) -> tuple[str, str, bytes, dict | None]:
-        """
-        Prefer JSON {transcript, reply, audio_base64, playback} (UTF-8 safe).
-        Fall back to legacy raw WAV + X-*-B64 / X-* headers.
-        """
-        content_type = (response.headers.get("content-type") or "").lower()
-        if "application/json" in content_type:
+        """Parse assist payload from an already-downloaded body."""
+        if "application/json" in content_type.lower():
             try:
-                payload = response.json()
+                payload = json.loads(body.decode("utf-8"))
             except Exception:
                 logger.exception("Failed to parse assist JSON")
                 return "", "", b"", None
@@ -1033,20 +1050,24 @@ class VoiceClient:
                 return transcript, reply, audio, playback
             return transcript, reply, audio, None
 
-        transcript = self._header_text(response, "Transcript")
-        reply = self._header_text(response, "Reply")
-        return transcript, reply, response.content, None
+        transcript = self._header_map_text(headers, "Transcript")
+        reply = self._header_map_text(headers, "Reply")
+        return transcript, reply, body, None
 
-    def _header_text(self, response: httpx.Response, name: str) -> str:
+    def _header_map_text(self, headers: dict[str, str], name: str) -> str:
         """Decode UTF-8 text from X-{name}-B64 (fallback to legacy X-{name})."""
-        b64 = response.headers.get(f"X-{name}-B64", "")
+        # httpx lowercases header names; accept either form.
+        b64 = headers.get(f"X-{name}-B64") or headers.get(f"x-{name.lower()}-b64") or ""
         if b64:
             try:
                 return base64.b64decode(b64.encode("ascii")).decode("utf-8")
             except Exception:
                 logger.warning("Failed to decode X-%s-B64", name)
-        return response.headers.get(f"X-{name}", "")
+        return headers.get(f"X-{name}") or headers.get(f"x-{name.lower()}") or ""
 
+    def _header_text(self, response: httpx.Response, name: str) -> str:
+        """Decode UTF-8 text from X-{name}-B64 (fallback to legacy X-{name})."""
+        return self._header_map_text(dict(response.headers), name)
     def _record_until_silence(
         self,
         preroll: np.ndarray | None = None,
