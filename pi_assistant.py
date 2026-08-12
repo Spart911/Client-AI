@@ -55,7 +55,7 @@ BARGE_ONSET_FRAMES = 2
 # Seconds to wait for the actual command after the reply was cut short.
 BARGE_COMMAND_WAIT_SEC = 5.0
 # After silence is detected, keep a short pad so word endings aren't clipped.
-RECORD_END_PAD_SEC = 0.35
+RECORD_END_PAD_SEC = 0.20
 # Quiet tail after TTS so ALSA/Pulse underruns don't eat the last syllable.
 TTS_END_PAD_SEC = 0.35
 # While waiting for wake with music on: keep mpv quieter so speech
@@ -208,8 +208,12 @@ class VoiceClient:
                     if not interrupted:
                         logger.warning("Empty recording, back to wake listen")
                     break
-                self._play_sent_cue()
-                # Non-None preroll means the user interrupted the reply.
+                # Non-blocking cue: start upload immediately, chime in background.
+                threading.Thread(
+                    target=self._play_sent_cue,
+                    name="sent-cue",
+                    daemon=True,
+                ).start()
                 preroll = self._assist_and_play(wav_bytes)
                 self._last_wake_ts = time.monotonic()
                 interrupted = preroll is not None
@@ -941,39 +945,60 @@ class VoiceClient:
 
     def _assist_and_play(self, wav_bytes: bytes) -> np.ndarray | None:
         """Send audio, play the reply; return barge-in preroll when interrupted."""
+        t0 = time.monotonic()
         logger.info("Sending utterance to backend (%d bytes)", len(wav_bytes))
-        with httpx.Client(timeout=300.0) as client:
-            files = {"file": ("command.wav", wav_bytes, "audio/wav")}
-            data = {
-                "return_audio": "true",
-                "device_id": self.device_id,
-            }
-            response = client.post(
-                f"{self.backend_url}/v1/assist",
-                files=files,
-                data=data,
-            )
-            if response.status_code >= 400:
-                logger.error(
-                    "Assist failed: %s %s",
-                    response.status_code,
-                    response.text,
+        # Pause music polling so the Pi isn't competing for CPU/network mid-assist.
+        music_was = self.music_poll
+        self.music_poll = False
+        try:
+            with httpx.Client(timeout=300.0) as client:
+                files = {"file": ("command.wav", wav_bytes, "audio/wav")}
+                data = {
+                    "return_audio": "true",
+                    "device_id": self.device_id,
+                }
+                response = client.post(
+                    f"{self.backend_url}/v1/assist",
+                    files=files,
+                    data=data,
                 )
-                return None
+                t_http = time.monotonic()
+                if response.status_code >= 400:
+                    logger.error(
+                        "Assist failed: %s %s",
+                        response.status_code,
+                        response.text,
+                    )
+                    return None
 
-            transcript, reply, audio, playback = self._parse_assist_response(response)
-            if transcript:
-                logger.info("You: %s", transcript)
-            if reply:
-                logger.info("OWUI: %s", reply)
-            if audio:
-                preroll = self._play_wav(audio, reply_text=reply)
-            else:
-                logger.error("Assist response has no audio payload")
-                preroll = None
-            if playback:
-                self._handle_playback(playback)
-            return preroll
+                body_len = len(response.content)
+                transcript, reply, audio, playback = self._parse_assist_response(response)
+                t_parse = time.monotonic()
+                logger.info(
+                    "Assist timing: http=%.1fs parse=%.1fs body=%dB audio=%dB",
+                    t_http - t0,
+                    t_parse - t_http,
+                    body_len,
+                    len(audio),
+                )
+                if transcript:
+                    logger.info("You: %s", transcript)
+                if reply:
+                    logger.info("OWUI: %s", reply)
+                if audio:
+                    preroll = self._play_wav(audio, reply_text=reply)
+                else:
+                    logger.error("Assist response has no audio payload")
+                    preroll = None
+                if playback:
+                    self._handle_playback(playback)
+                logger.info(
+                    "Assist total=%.1fs (play included)",
+                    time.monotonic() - t0,
+                )
+                return preroll
+        finally:
+            self.music_poll = music_was
 
     def _parse_assist_response(
         self,
@@ -1183,6 +1208,9 @@ class VoiceClient:
     def _music_poll_loop(self) -> None:
         url = f"{self.backend_url}/v1/music/pending/{self.device_id}"
         while not self._music_stop.is_set():
+            if not self.music_poll:
+                self._music_stop.wait(self.music_poll_interval)
+                continue
             try:
                 with httpx.Client(timeout=30.0) as client:
                     response = client.get(url)
