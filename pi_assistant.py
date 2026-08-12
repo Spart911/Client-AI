@@ -55,7 +55,7 @@ BARGE_ONSET_FRAMES = 2
 # Seconds to wait for the actual command after the reply was cut short.
 BARGE_COMMAND_WAIT_SEC = 5.0
 # After silence is detected, keep a short pad so word endings aren't clipped.
-RECORD_END_PAD_SEC = 0.20
+RECORD_END_PAD_SEC = 0.12
 # Quiet tail after TTS so ALSA/Pulse underruns don't eat the last syllable.
 TTS_END_PAD_SEC = 0.35
 # While waiting for wake with music on: keep mpv quieter so speech
@@ -81,7 +81,7 @@ class VoiceClient:
         self,
         backend_url: str,
         wake_words: list[str] | None = None,
-        silence_sec: float = 1.8,
+        silence_sec: float = 0.6,
         max_utterance_sec: float = 20.0,
         energy_threshold: float = 0.01,
         wake_engine: str = DEFAULT_WAKE_ENGINE,
@@ -156,6 +156,11 @@ class VoiceClient:
         self._volume_level = 7  # 1..10
         self._mpv_ipc_path = Path(tempfile.gettempdir()) / f"voice-mpv-{os.getpid()}.sock"
         self._in_wake_listen = False
+        # Reuse TCP/TLS across assist + music polls (saves handshake each turn).
+        self._http = httpx.Client(
+            timeout=httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0),
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+        )
 
     def run(self) -> None:
         logger.info("Backend: %s", self.backend_url)
@@ -172,10 +177,15 @@ class VoiceClient:
         self._sync_volume_from_backend()
         if self.music_poll:
             self._start_music_poller()
+        wake_label = (
+            self._mww_wake_word
+            or (self.wake_words[0] if self.wake_words else self.oww_model)
+            or "wake"
+        )
         logger.info(
             "Wake mode: %s — say «%s …» then your command.",
             self._wake_mode,
-            self.wake_words[0] if self.wake_words else "alexa",
+            wake_label,
         )
         logger.info(
             "Barge-in: %s",
@@ -297,9 +307,8 @@ class VoiceClient:
 
     def _warmup_backend(self) -> None:
         try:
-            with httpx.Client(timeout=5.0) as client:
-                response = client.get(f"{self.backend_url}/health")
-                response.raise_for_status()
+            response = self._http.get(f"{self.backend_url}/health", timeout=5.0)
+            response.raise_for_status()
         except Exception as exc:
             logger.error("Backend not reachable at %s: %s", self.backend_url, exc)
             sys.exit(1)
@@ -951,52 +960,52 @@ class VoiceClient:
         music_was = self.music_poll
         self.music_poll = False
         try:
-            with httpx.Client(timeout=300.0) as client:
-                files = {"file": ("command.wav", wav_bytes, "audio/wav")}
-                data = {
-                    "return_audio": "true",
-                    "device_id": self.device_id,
-                }
-                response = client.post(
-                    f"{self.backend_url}/v1/assist",
-                    files=files,
-                    data=data,
+            files = {"file": ("command.wav", wav_bytes, "audio/wav")}
+            data = {
+                "return_audio": "true",
+                "device_id": self.device_id,
+            }
+            response = self._http.post(
+                f"{self.backend_url}/v1/assist",
+                files=files,
+                data=data,
+                timeout=300.0,
+            )
+            t_http = time.monotonic()
+            if response.status_code >= 400:
+                logger.error(
+                    "Assist failed: %s %s",
+                    response.status_code,
+                    response.text,
                 )
-                t_http = time.monotonic()
-                if response.status_code >= 400:
-                    logger.error(
-                        "Assist failed: %s %s",
-                        response.status_code,
-                        response.text,
-                    )
-                    return None
+                return None
 
-                body_len = len(response.content)
-                transcript, reply, audio, playback = self._parse_assist_response(response)
-                t_parse = time.monotonic()
-                logger.info(
-                    "Assist timing: http=%.1fs parse=%.1fs body=%dB audio=%dB",
-                    t_http - t0,
-                    t_parse - t_http,
-                    body_len,
-                    len(audio),
-                )
-                if transcript:
-                    logger.info("You: %s", transcript)
-                if reply:
-                    logger.info("OWUI: %s", reply)
-                if audio:
-                    preroll = self._play_wav(audio, reply_text=reply)
-                else:
-                    logger.error("Assist response has no audio payload")
-                    preroll = None
-                if playback:
-                    self._handle_playback(playback)
-                logger.info(
-                    "Assist total=%.1fs (play included)",
-                    time.monotonic() - t0,
-                )
-                return preroll
+            body_len = len(response.content)
+            transcript, reply, audio, playback = self._parse_assist_response(response)
+            t_parse = time.monotonic()
+            logger.info(
+                "Assist timing: http=%.1fs parse=%.1fs body=%dB audio=%dB",
+                t_http - t0,
+                t_parse - t_http,
+                body_len,
+                len(audio),
+            )
+            if transcript:
+                logger.info("You: %s", transcript)
+            if reply:
+                logger.info("OWUI: %s", reply)
+            if audio:
+                preroll = self._play_wav(audio, reply_text=reply)
+            else:
+                logger.error("Assist response has no audio payload")
+                preroll = None
+            if playback:
+                self._handle_playback(playback)
+            logger.info(
+                "Assist total=%.1fs (play included)",
+                time.monotonic() - t0,
+            )
+            return preroll
         finally:
             self.music_poll = music_was
 
@@ -1110,7 +1119,10 @@ class VoiceClient:
         chunks = lead + frames
         if not chunks:
             return b""
-        return self._frames_to_wav(np.concatenate(chunks))
+        audio = self._trim_utterance(np.concatenate(chunks))
+        if audio.size == 0:
+            return b""
+        return self._frames_to_wav(audio)
 
     def _play_listen_cue(self) -> None:
         """Short pleasant chime: assistant is listening for the command."""
@@ -1212,8 +1224,7 @@ class VoiceClient:
                 self._music_stop.wait(self.music_poll_interval)
                 continue
             try:
-                with httpx.Client(timeout=30.0) as client:
-                    response = client.get(url)
+                response = self._http.get(url, timeout=30.0)
                 if response.status_code < 400:
                     payload = response.json()
                     for command in payload.get("commands") or []:
@@ -1227,8 +1238,7 @@ class VoiceClient:
         """Pull last known volume from server; fall back to local default."""
         url = f"{self.backend_url}/v1/music/status/{self.device_id}"
         try:
-            with httpx.Client(timeout=10.0) as client:
-                response = client.get(url)
+            response = self._http.get(url, timeout=10.0)
             if response.status_code < 400:
                 payload = response.json() or {}
                 level = int(payload.get("volume") or self._volume_level)
@@ -1419,17 +1429,17 @@ class VoiceClient:
     def _report_track_finished(self, track_id: str) -> None:
         url = f"{self.backend_url}/v1/music/status/{self.device_id}"
         try:
-            with httpx.Client(timeout=20.0) as client:
-                client.post(
-                    url,
-                    json={
-                        "device_id": self.device_id,
-                        "playing": False,
-                        "action": "track_finished",
-                        "title": "",
-                        "artist": "",
-                    },
-                )
+            self._http.post(
+                url,
+                json={
+                    "device_id": self.device_id,
+                    "playing": False,
+                    "action": "track_finished",
+                    "title": "",
+                    "artist": "",
+                },
+                timeout=20.0,
+            )
             logger.info("Reported track_finished (track_id=%s)", track_id or "-")
         except Exception as exc:
             logger.debug("track_finished report failed: %s", exc)
@@ -1556,6 +1566,39 @@ class VoiceClient:
             )
         return None
 
+    def _trim_utterance(self, frames: np.ndarray) -> np.ndarray:
+        """Drop leading/trailing hush so upload + STT see less silence."""
+        if frames.size < int(SAMPLE_RATE * 0.2):
+            return frames
+        win = max(1, int(SAMPLE_RATE * 0.02))  # 20 ms
+        thr = self.energy_threshold * 0.45
+        n_wins = frames.size // win
+        if n_wins < 3:
+            return frames
+        energies = np.empty(n_wins, dtype=np.float32)
+        for i in range(n_wins):
+            chunk = frames[i * win : (i + 1) * win]
+            energies[i] = float(np.sqrt(np.mean(np.square(chunk))))
+        speech = np.flatnonzero(energies >= thr)
+        if speech.size == 0:
+            return frames
+        pad_pre = 4   # ~80 ms before first speech
+        pad_post = 6  # ~120 ms after last speech
+        start = max(0, int(speech[0]) - pad_pre) * win
+        end = min(frames.size, (int(speech[-1]) + 1 + pad_post) * win)
+        trimmed = frames[start:end]
+        if trimmed.size < int(SAMPLE_RATE * 0.15):
+            return frames
+        dropped_ms = int(1000 * (frames.size - trimmed.size) / SAMPLE_RATE)
+        if dropped_ms >= 80:
+            logger.info(
+                "Trimmed utterance: %d→%d samples (−%dms)",
+                frames.size,
+                trimmed.size,
+                dropped_ms,
+            )
+        return trimmed
+
     def _frames_to_wav(self, frames: np.ndarray) -> bytes:
         pcm = (np.clip(frames, -1.0, 1.0) * 32767.0).astype(np.int16)
         buf = io.BytesIO()
@@ -1632,8 +1675,8 @@ def main() -> None:
     parser.add_argument(
         "--silence",
         type=float,
-        default=float(os.getenv("SILENCE_SEC", "1.8")),
-        help="Seconds of quiet before ending the command recording (default 1.8)",
+        default=float(os.getenv("SILENCE_SEC", "0.6")),
+        help="Seconds of quiet before ending the command recording (default 0.6)",
     )
     parser.add_argument("--max-sec", type=float, default=20.0)
     parser.add_argument(
