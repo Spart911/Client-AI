@@ -6,8 +6,9 @@
 #   BT_PROFILE=handsfree_head_unit     HFP mic+speaker (default)
 #                                      use a2dp_sink for speaker-only
 #   BT_CONNECT_INTERVAL=15             seconds between reconnect attempts
-#   BT_KEEPALIVE_SEC=300               ultra-quiet blip so speaker won't sleep
+#   BT_KEEPALIVE_SEC=120               quiet blip so speaker won't sleep
 #                                      (0 = disable). Speakers often sleep ~10–15 min.
+#                                      Use mid-band tone: HFP filters out ~40 Hz.
 #
 # Usage:
 #   BT_DEVICE_MAC=AA:BB:CC:DD:EE:FF bash scripts/bt-connect.sh
@@ -40,9 +41,10 @@ MAC="${BT_DEVICE_MAC:-${BT_MAC:-}}"
 PROFILE="${BT_PROFILE:-handsfree_head_unit}"
 INTERVAL="${BT_CONNECT_INTERVAL:-15}"
 ONCE="${BT_CONNECT_ONCE:-false}"
-# Default: blip every 5 min (below typical 10–15 min speaker auto-off).
-KEEPALIVE_SEC="${BT_KEEPALIVE_SEC:-300}"
-KEEPALIVE_WAV="${BT_KEEPALIVE_WAV:-/tmp/voice-bt-keepalive.wav}"
+# Default: blip every 2 min (HFP-audible tone; 40 Hz was filtered and useless).
+KEEPALIVE_SEC="${BT_KEEPALIVE_SEC:-120}"
+KEEPALIVE_VOL="${BT_KEEPALIVE_VOL:-3500}"  # paplay 0..65536; ~5% — soft but present
+KEEPALIVE_WAV="${BT_KEEPALIVE_WAV:-/tmp/voice-bt-keepalive-v2.wav}"
 _last_keepalive_ts=0
 
 if [[ -z "${MAC}" ]]; then
@@ -191,7 +193,8 @@ apply_pulse() {
 }
 
 ensure_keepalive_wav() {
-  # ~120 ms, ~40 Hz, amplitude ~0.15% FS — usually inaudible on HFP.
+  # HFP is ~300–3400 Hz: a 40 Hz tone never reaches the speaker amp.
+  # Soft 700 Hz / ~350 ms — quiet tick, enough for most auto-off timers.
   if [[ -f "${KEEPALIVE_WAV}" ]]; then
     return 0
   fi
@@ -199,7 +202,7 @@ ensure_keepalive_wav() {
 import math, struct, sys, wave
 
 path = sys.argv[1]
-rate, dur, freq, amp = 16000, 0.12, 40.0, 50  # amp out of 32767
+rate, dur, freq, amp = 16000, 0.35, 700.0, 900  # amp out of 32767 (~2.7%)
 n = max(1, int(rate * dur))
 with wave.open(path, "w") as w:
     w.setnchannels(1)
@@ -207,10 +210,10 @@ with wave.open(path, "w") as w:
     w.setframerate(rate)
     frames = bytearray()
     for i in range(n):
-        # Tiny raised-cosine envelope — no click.
+        # Raised-cosine envelope — no click.
         env = math.sin(math.pi * i / max(1, n - 1))
         sample = int(amp * env * math.sin(2 * math.pi * freq * i / rate))
-        frames += struct.pack("<h", sample)
+        frames += struct.pack("<h", max(-32767, min(32767, sample)))
     w.writeframes(frames)
 PY
 }
@@ -249,16 +252,17 @@ maybe_keepalive() {
     log "failed to build keepalive wav"
     return 0
   }
-  local sink
+  local sink vol
   sink="$(pactl get-default-sink 2>/dev/null || true)"
-  # paplay --volume: 0..65536; ~400 ≈ 0.6% — on top of already tiny WAV.
+  vol="${KEEPALIVE_VOL}"
+  # paplay --volume: 0..65536
   if [[ -n "${sink}" ]]; then
-    paplay --device="${sink}" --volume=400 "${KEEPALIVE_WAV}" >/dev/null 2>&1 || true
+    paplay --device="${sink}" --volume="${vol}" "${KEEPALIVE_WAV}" >/dev/null 2>&1 || true
   else
-    paplay --volume=400 "${KEEPALIVE_WAV}" >/dev/null 2>&1 || true
+    paplay --volume="${vol}" "${KEEPALIVE_WAV}" >/dev/null 2>&1 || true
   fi
   _last_keepalive_ts="${now}"
-  log "keepalive blip (ultra-quiet)"
+  log "keepalive blip (vol=${vol})"
 }
 
 cycle() {
@@ -282,7 +286,9 @@ cycle() {
   fi
 }
 
-log "MAC=${mac_norm} profile=${PROFILE} interval=${INTERVAL}s keepalive=${KEEPALIVE_SEC}s"
+log "MAC=${mac_norm} profile=${PROFILE} interval=${INTERVAL}s keepalive=${KEEPALIVE_SEC}s vol=${KEEPALIVE_VOL}"
+# Drop legacy inaudible 40 Hz sample if present.
+rm -f /tmp/voice-bt-keepalive.wav 2>/dev/null || true
 _last_keepalive_ts="$(date +%s)"
 cycle
 
