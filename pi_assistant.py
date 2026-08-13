@@ -56,6 +56,9 @@ BARGE_ONSET_FRAMES = 2
 BARGE_COMMAND_WAIT_SEC = 5.0
 # After silence is detected, keep a short pad so word endings aren't clipped.
 RECORD_END_PAD_SEC = 0.12
+# Don't end on silence until this long into the capture (HFP listen-chime
+# briefly mutes the mic — otherwise we get listen-beep then instant sent-beep).
+RECORD_MIN_SEC = 1.8
 # Quiet tail after TTS so ALSA/Pulse underruns don't eat the last syllable.
 TTS_END_PAD_SEC = 0.35
 # While waiting for wake with music on: keep mpv quieter so speech
@@ -72,6 +75,55 @@ DEFAULT_OWW_THRESHOLD = 0.35
 # tflite works on Pi 3B 32-bit; onnxruntime usually needs arm64/x86_64.
 DEFAULT_OWW_FRAMEWORK = "tflite"
 DEFAULT_WAKE_ENGINE = "oww"
+# High-pass for street/traffic rumble on HFP (Hz).
+DEFAULT_NOISE_HP_HZ = 280.0
+
+
+class MicDenoise:
+    """
+    Lightweight mic cleanup for Pi + HFP: high-pass + adaptive soft gate.
+
+    Cuts low rumble (cars/windows) and attenuates steady background when it
+    sits near the noise floor. Cheap enough for every 80–100 ms frame.
+    """
+
+    def __init__(self, rate: int = SAMPLE_RATE, hp_hz: float = DEFAULT_NOISE_HP_HZ) -> None:
+        from scipy.signal import butter, sosfilt_zi
+
+        self.rate = rate
+        self.hp_hz = float(np.clip(hp_hz, 80.0, 800.0))
+        self._sos = butter(2, self.hp_hz, btype="highpass", fs=rate, output="sos")
+        self._zi = sosfilt_zi(self._sos) * 0.0
+        self.noise_rms = 0.008
+        self._adapt = 0.04
+
+    def reset(self) -> None:
+        from scipy.signal import sosfilt_zi
+
+        self._zi = sosfilt_zi(self._sos) * 0.0
+        self.noise_rms = 0.008
+
+    def process(self, frame: np.ndarray) -> np.ndarray:
+        from scipy.signal import sosfilt
+
+        x = frame.astype(np.float32, copy=False)
+        if x.size == 0:
+            return x
+        y, self._zi = sosfilt(self._sos, x, zi=self._zi)
+        y = np.asarray(y, dtype=np.float32)
+        rms = float(np.sqrt(np.mean(np.square(y)))) if y.size else 0.0
+        # Adapt noise floor only on quiet-ish frames.
+        if rms < self.noise_rms * 2.2:
+            self.noise_rms = (
+                (1.0 - self._adapt) * self.noise_rms
+                + self._adapt * max(rms, 1e-5)
+            )
+        thr = max(self.noise_rms * 2.8, 1e-4)
+        if rms < thr:
+            # Soft quadratic gate — keeps speech onsets, ducks hiss/traffic bed.
+            gain = (rms / thr) ** 2
+            y = y * gain
+        return np.clip(y, -1.0, 1.0)
 
 
 class VoiceClient:
@@ -100,6 +152,8 @@ class VoiceClient:
         music_poll_interval: float = 2.0,
         mpv_command: str = "",
         audio_device: str | int | None = None,
+        noise_suppress: bool = True,
+        noise_hp_hz: float = DEFAULT_NOISE_HP_HZ,
     ) -> None:
         self.backend_url = backend_url.rstrip("/")
         self.device_id = (device_id or "default").strip() or "default"
@@ -107,6 +161,14 @@ class VoiceClient:
         self.music_poll_interval = max(0.5, music_poll_interval)
         self.mpv_command = (mpv_command or "").strip() or shutil.which("mpv") or "mpv"
         self.audio_device = audio_device
+        self.noise_suppress = bool(noise_suppress)
+        self._denoise: MicDenoise | None = None
+        if self.noise_suppress:
+            try:
+                self._denoise = MicDenoise(SAMPLE_RATE, hp_hz=noise_hp_hz)
+            except Exception:
+                logger.warning("Mic denoise unavailable — continuing without it", exc_info=True)
+                self.noise_suppress = False
         self.wake_engine = (wake_engine or DEFAULT_WAKE_ENGINE).strip().lower()
         if self.wake_engine not in ("oww", "mww"):
             self.wake_engine = DEFAULT_WAKE_ENGINE
@@ -171,6 +233,13 @@ class VoiceClient:
             self.oww_model,
             self.oww_threshold,
         )
+        if self._denoise is not None:
+            logger.info(
+                "Mic denoise: on (highpass=%.0fHz + soft gate)",
+                self._denoise.hp_hz,
+            )
+        else:
+            logger.info("Mic denoise: off")
         self._configure_audio_device()
         # Bluetooth HFP SCO often arrives wedged after reboot/TTS — reseat before listen.
         if (os.getenv("BT_DEVICE_MAC") or os.getenv("BT_MAC") or "").strip():
@@ -550,6 +619,8 @@ class VoiceClient:
         try:
             self._mww.reset()
             self._mww_features.reset()
+            if self._denoise is not None:
+                self._denoise.reset()
             sync_music_duck()
             with sd.InputStream(
                 samplerate=SAMPLE_RATE,
@@ -568,6 +639,9 @@ class VoiceClient:
                         continue
                     mono = chunk.reshape(-1).astype(np.int16, copy=False)
                     frame_f = mono.astype(np.float32) / 32768.0
+                    if self._denoise is not None:
+                        frame_f = self._denoise.process(frame_f)
+                        mono = np.clip(frame_f * 32768.0, -32768, 32767).astype(np.int16)
                     frame_energy = self._rms(frame_f)
                     frames_seen += 1
                     peak_energy = max(peak_energy, frame_energy)
@@ -782,6 +856,8 @@ class VoiceClient:
 
         try:
             self._oww.reset()
+            if self._denoise is not None:
+                self._denoise.reset()
             sync_music_duck()
             with sd.InputStream(
                 samplerate=SAMPLE_RATE,
@@ -806,6 +882,9 @@ class VoiceClient:
                         else:
                             mono = mono[:block]
                     frame_f = mono.astype(np.float32) / 32768.0
+                    if self._denoise is not None:
+                        frame_f = self._denoise.process(frame_f)
+                        mono = np.clip(frame_f * 32768.0, -32768, 32767).astype(np.int16)
                     frame_energy = self._rms(frame_f)
                     frames_seen += 1
                     if frame_energy > peak_energy:
@@ -1095,6 +1174,7 @@ class VoiceClient:
         silence_blocks = int(self.silence_sec / 0.1)
         max_blocks = int(self.max_utterance_sec / 0.1)
         wait_blocks = int((start_timeout_sec or self.max_utterance_sec) / 0.1)
+        min_blocks = max(1, int(RECORD_MIN_SEC / 0.1))
         # Soft floor so quiet word endings don't count as silence immediately.
         continue_threshold = self.energy_threshold * 0.4
         lead: list[np.ndarray] = []
@@ -1116,7 +1196,12 @@ class VoiceClient:
             for index in range(max_blocks):
                 data, _ = stream.read(block)
                 mono = data[:, 0]
+                if self._denoise is not None:
+                    mono = self._denoise.process(mono)
                 energy = self._rms(mono)
+                # paplay listen/sent chime on HFP often zeros the mic briefly.
+                if self._pulse_sink_busy():
+                    silent = 0
                 if energy >= self.energy_threshold:
                     started = True
                     silent = 0
@@ -1128,7 +1213,7 @@ class VoiceClient:
                         silent = max(0, silent - 1)
                     else:
                         silent += 1
-                        if silent >= silence_blocks:
+                        if silent >= silence_blocks and index >= min_blocks:
                             break
                 else:
                     frames.append(mono.copy())
@@ -1154,6 +1239,21 @@ class VoiceClient:
         if audio.size == 0:
             return b""
         return self._frames_to_wav(audio)
+
+    def _pulse_sink_busy(self) -> bool:
+        """True if something (chime/TTS/music) is currently playing via Pulse."""
+        if not shutil.which("pactl"):
+            return False
+        try:
+            out = subprocess.check_output(
+                ["pactl", "list", "short", "sink-inputs"],
+                text=True,
+                timeout=1,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            return False
+        return bool(out.strip())
 
     def _play_chime_array(self, audio: np.ndarray) -> None:
         """Play a short chime via paplay (HFP-safe); fall back to sounddevice."""
@@ -1986,6 +2086,25 @@ def main() -> None:
         default=os.getenv("AUDIO_INPUT_DEVICE", ""),
         help="sounddevice index, 'in,out', or name substring (e.g. pulse / bluez)",
     )
+    parser.add_argument(
+        "--noise-suppress",
+        dest="noise_suppress",
+        action="store_true",
+        default=os.getenv("NOISE_SUPPRESS", "true").lower() in ("1", "true", "yes"),
+        help="High-pass + soft noise gate on mic (default on)",
+    )
+    parser.add_argument(
+        "--no-noise-suppress",
+        dest="noise_suppress",
+        action="store_false",
+        help="Disable mic denoise",
+    )
+    parser.add_argument(
+        "--noise-hp-hz",
+        type=float,
+        default=float(os.getenv("NOISE_HP_HZ", str(DEFAULT_NOISE_HP_HZ))),
+        help="Mic high-pass cutoff Hz for traffic rumble (default 280)",
+    )
     args = parser.parse_args()
 
     wake_words = [raw.strip() for raw in args.wake.split(",") if raw.strip()]
@@ -2010,6 +2129,8 @@ def main() -> None:
         device_id=args.device_id,
         music_poll=args.music_poll,
         music_poll_interval=args.music_poll_interval,
+        noise_suppress=args.noise_suppress,
+        noise_hp_hz=args.noise_hp_hz,
         mpv_command=args.mpv,
         audio_device=args.audio_device or None,
     )
