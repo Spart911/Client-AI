@@ -97,7 +97,28 @@ wait_card() {
   return 1
 }
 
+current_card_profile() {
+  # Active Profile: handsfree_head_unit
+  pactl list cards 2>/dev/null | awk -v id="${card_id}" '
+    $0 ~ "Name: " id { found=1 }
+    found && /Active Profile:/ { print $3; exit }
+  '
+}
+
+pulse_defaults_ok() {
+  local sink source def_sink def_source mac_us
+  mac_us="$(echo "${mac_norm}" | tr ':' '_')"
+  def_sink="$(pactl get-default-sink 2>/dev/null || true)"
+  def_source="$(pactl get-default-source 2>/dev/null || true)"
+  [[ "${def_sink}" == *"${mac_us}"* ]] || return 1
+  if [[ "${PROFILE}" != "a2dp_sink" ]]; then
+    [[ "${def_source}" == *"${mac_us}"* ]] || return 1
+  fi
+  return 0
+}
+
 apply_pulse() {
+  local force="${1:-false}"
   if ! command -v pactl >/dev/null 2>&1; then
     log "pactl not found — skip Pulse routing"
     return 0
@@ -107,12 +128,21 @@ apply_pulse() {
     return 1
   fi
 
-  log "profile ${card_id} → ${PROFILE}"
-  pactl set-card-profile "${card_id}" "${PROFILE}" 2>/dev/null || {
-    log "failed to set profile ${PROFILE} (is the device HFP-capable?)"
-    return 1
-  }
-  sleep 1
+  local active
+  active="$(current_card_profile || true)"
+  if [[ "${force}" != "true" && "${active}" == "${PROFILE}" ]] && pulse_defaults_ok; then
+    # Already routed — do not re-set profile (can glitch/disconnect some speakers).
+    return 0
+  fi
+
+  if [[ "${active}" != "${PROFILE}" ]]; then
+    log "profile ${card_id} → ${PROFILE} (was: ${active:-none})"
+    pactl set-card-profile "${card_id}" "${PROFILE}" 2>/dev/null || {
+      log "failed to set profile ${PROFILE} (is the device HFP-capable?)"
+      return 1
+    }
+    sleep 1
+  fi
 
   # Prefer sinks/sources that belong to this card + profile.
   local sink source
@@ -130,15 +160,22 @@ apply_pulse() {
   ' || true)"
 
   if [[ -n "${sink}" ]]; then
-    log "default sink → ${sink}"
-    pactl set-default-sink "${sink}" || true
+    local def_sink
+    def_sink="$(pactl get-default-sink 2>/dev/null || true)"
+    if [[ "${def_sink}" != "${sink}" ]]; then
+      log "default sink → ${sink}"
+      pactl set-default-sink "${sink}" || true
+    fi
   fi
   if [[ -n "${source}" ]]; then
-    log "default source → ${source}"
-    pactl set-default-source "${source}" || true
+    local def_source
+    def_source="$(pactl get-default-source 2>/dev/null || true)"
+    if [[ "${def_source}" != "${source}" ]]; then
+      log "default source → ${source}"
+      pactl set-default-source "${source}" || true
+    fi
     mic_vol="${BT_MIC_VOLUME:-200%}"
     if [[ -n "${mic_vol}" ]]; then
-      log "source volume → ${mic_vol}"
       pactl set-source-volume "${source}" "${mic_vol}" || true
     fi
   elif [[ "${PROFILE}" == "a2dp_sink" ]]; then
@@ -148,9 +185,20 @@ apply_pulse() {
 }
 
 cycle() {
+  local was_connected=false
+  if bt_connected; then
+    was_connected=true
+  fi
   if try_connect; then
-    apply_pulse || true
-    log "ok (connected=$(bt_connected && echo yes || echo no))"
+    if [[ "${was_connected}" == "true" ]]; then
+      apply_pulse false || true
+    else
+      # Fresh (re)connect — force profile + routing.
+      apply_pulse true || true
+      log "ok (connected=yes, reconnected)"
+      return 0
+    fi
+    # Quiet when healthy — log only occasionally via reconnect path.
   else
     log "connect failed — will retry"
   fi
