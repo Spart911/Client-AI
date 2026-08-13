@@ -6,6 +6,8 @@
 #   BT_PROFILE=handsfree_head_unit     HFP mic+speaker (default)
 #                                      use a2dp_sink for speaker-only
 #   BT_CONNECT_INTERVAL=15             seconds between reconnect attempts
+#   BT_KEEPALIVE_SEC=300               ultra-quiet blip so speaker won't sleep
+#                                      (0 = disable). Speakers often sleep ~10–15 min.
 #
 # Usage:
 #   BT_DEVICE_MAC=AA:BB:CC:DD:EE:FF bash scripts/bt-connect.sh
@@ -38,6 +40,10 @@ MAC="${BT_DEVICE_MAC:-${BT_MAC:-}}"
 PROFILE="${BT_PROFILE:-handsfree_head_unit}"
 INTERVAL="${BT_CONNECT_INTERVAL:-15}"
 ONCE="${BT_CONNECT_ONCE:-false}"
+# Default: blip every 5 min (below typical 10–15 min speaker auto-off).
+KEEPALIVE_SEC="${BT_KEEPALIVE_SEC:-300}"
+KEEPALIVE_WAV="${BT_KEEPALIVE_WAV:-/tmp/voice-bt-keepalive.wav}"
+_last_keepalive_ts=0
 
 if [[ -z "${MAC}" ]]; then
   echo "BT_DEVICE_MAC is not set. Put it in .env, e.g.:" >&2
@@ -184,6 +190,77 @@ apply_pulse() {
   return 0
 }
 
+ensure_keepalive_wav() {
+  # ~120 ms, ~40 Hz, amplitude ~0.15% FS — usually inaudible on HFP.
+  if [[ -f "${KEEPALIVE_WAV}" ]]; then
+    return 0
+  fi
+  python3 - "${KEEPALIVE_WAV}" <<'PY'
+import math, struct, sys, wave
+
+path = sys.argv[1]
+rate, dur, freq, amp = 16000, 0.12, 40.0, 50  # amp out of 32767
+n = max(1, int(rate * dur))
+with wave.open(path, "w") as w:
+    w.setnchannels(1)
+    w.setsampwidth(2)
+    w.setframerate(rate)
+    frames = bytearray()
+    for i in range(n):
+        # Tiny raised-cosine envelope — no click.
+        env = math.sin(math.pi * i / max(1, n - 1))
+        sample = int(amp * env * math.sin(2 * math.pi * freq * i / rate))
+        frames += struct.pack("<h", sample)
+    w.writeframes(frames)
+PY
+}
+
+sink_has_other_audio() {
+  # Skip keepalive while TTS / music already plays on any sink.
+  local n
+  n="$(pactl list short sink-inputs 2>/dev/null | wc -l | tr -d ' ')"
+  [[ "${n}" -gt 0 ]]
+}
+
+maybe_keepalive() {
+  local sec now
+  sec="${KEEPALIVE_SEC}"
+  if [[ -z "${sec}" || "${sec}" == "0" ]]; then
+    return 0
+  fi
+  if ! bt_connected; then
+    return 0
+  fi
+  now="$(date +%s)"
+  if (( now - _last_keepalive_ts < sec )); then
+    return 0
+  fi
+  if sink_has_other_audio; then
+    # Real audio already keeps the speaker awake — just refresh the timer.
+    _last_keepalive_ts="${now}"
+    return 0
+  fi
+  if ! command -v paplay >/dev/null 2>&1; then
+    log "paplay missing — keepalive disabled"
+    KEEPALIVE_SEC=0
+    return 0
+  fi
+  ensure_keepalive_wav || {
+    log "failed to build keepalive wav"
+    return 0
+  }
+  local sink
+  sink="$(pactl get-default-sink 2>/dev/null || true)"
+  # paplay --volume: 0..65536; ~400 ≈ 0.6% — on top of already tiny WAV.
+  if [[ -n "${sink}" ]]; then
+    paplay --device="${sink}" --volume=400 "${KEEPALIVE_WAV}" >/dev/null 2>&1 || true
+  else
+    paplay --volume=400 "${KEEPALIVE_WAV}" >/dev/null 2>&1 || true
+  fi
+  _last_keepalive_ts="${now}"
+  log "keepalive blip (ultra-quiet)"
+}
+
 cycle() {
   local was_connected=false
   if bt_connected; then
@@ -196,15 +273,17 @@ cycle() {
       # Fresh (re)connect — force profile + routing.
       apply_pulse true || true
       log "ok (connected=yes, reconnected)"
+      _last_keepalive_ts="$(date +%s)"
       return 0
     fi
-    # Quiet when healthy — log only occasionally via reconnect path.
+    maybe_keepalive || true
   else
     log "connect failed — will retry"
   fi
 }
 
-log "MAC=${mac_norm} profile=${PROFILE} interval=${INTERVAL}s"
+log "MAC=${mac_norm} profile=${PROFILE} interval=${INTERVAL}s keepalive=${KEEPALIVE_SEC}s"
+_last_keepalive_ts="$(date +%s)"
 cycle
 
 if [[ "${ONCE}" == "true" ]]; then
