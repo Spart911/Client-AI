@@ -1585,6 +1585,118 @@ class VoiceClient:
         finally:
             path.unlink(missing_ok=True)
 
+    def _bluez_sink_active(self) -> bool:
+        if not shutil.which("pactl"):
+            return False
+        try:
+            sink = subprocess.check_output(
+                ["pactl", "get-default-sink"],
+                text=True,
+                timeout=2,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except Exception:
+            return False
+        return "bluez" in sink.lower()
+
+    def _restore_hfp_audio(self) -> None:
+        """
+        Re-assert Bluetooth HFP after TTS.
+
+        paplay / Pulse often leave the SCO link wedged or flip the card away from
+        handsfree_head_unit — mic then stays silent until profile is bounced.
+        """
+        if not shutil.which("pactl"):
+            return
+        mac = (os.getenv("BT_DEVICE_MAC") or os.getenv("BT_MAC") or "").strip()
+        if not mac:
+            return
+        profile = (os.getenv("BT_PROFILE") or "handsfree_head_unit").strip()
+        mac_us = mac.upper().replace(":", "_").replace("-", "_")
+        card = f"bluez_card.{mac_us}"
+        try:
+            cards = subprocess.check_output(
+                ["pactl", "list", "cards", "short"],
+                text=True,
+                timeout=3,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            return
+        if card not in cards:
+            return
+        try:
+            # Bounce profile so the HFP capture source comes back alive.
+            subprocess.run(
+                ["pactl", "set-card-profile", card, "off"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            time.sleep(0.35)
+            subprocess.run(
+                ["pactl", "set-card-profile", card, profile],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            time.sleep(0.4)
+            sink = ""
+            source = ""
+            for line in subprocess.check_output(
+                ["pactl", "list", "short", "sinks"],
+                text=True,
+                timeout=3,
+                stderr=subprocess.DEVNULL,
+            ).splitlines():
+                name = line.split()[1] if len(line.split()) > 1 else ""
+                if mac_us in name:
+                    sink = name
+                    break
+            for line in subprocess.check_output(
+                ["pactl", "list", "short", "sources"],
+                text=True,
+                timeout=3,
+                stderr=subprocess.DEVNULL,
+            ).splitlines():
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                name = parts[1]
+                if mac_us in name and not name.endswith(".monitor"):
+                    source = name
+                    break
+            if sink:
+                subprocess.run(
+                    ["pactl", "set-default-sink", sink],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                )
+            if source:
+                subprocess.run(
+                    ["pactl", "set-default-source", source],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                )
+                mic_vol = (os.getenv("BT_MIC_VOLUME") or "200%").strip()
+                if mic_vol:
+                    subprocess.run(
+                        ["pactl", "set-source-volume", source, mic_vol],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=3,
+                    )
+            logger.info("Restored BT audio profile %s on %s", profile, card)
+        except Exception:
+            logger.debug("HFP restore failed", exc_info=True)
+
     def _play_wav_paplay(
         self,
         paplay: str,
@@ -1592,7 +1704,13 @@ class VoiceClient:
         duration: float,
         reply_text: str = "",
     ) -> np.ndarray | None:
-        """Play via Pulse paplay; optional barge-in uses sounddevice mic only."""
+        """Play via Pulse paplay; barge-in only when not on Bluetooth HFP."""
+        # Concurrent mic capture during paplay on HFP often kills the SCO mic
+        # afterwards («unstuck but can't hear»). Keep barge-in for non-BT sinks.
+        use_barge = self.barge_in and not self._bluez_sink_active()
+        if self.barge_in and not use_barge:
+            logger.info("Barge-in deferred on Bluetooth HFP (keeps mic alive)")
+
         proc = subprocess.Popen(
             [paplay, str(path)],
             stdout=subprocess.DEVNULL,
@@ -1600,7 +1718,7 @@ class VoiceClient:
         )
         preroll: np.ndarray | None = None
         try:
-            if self.barge_in:
+            if use_barge:
                 preroll = self._watch_barge_in(reply_text, duration)
                 if preroll is not None:
                     logger.info("Barge-in detected — playback stopped")
@@ -1627,6 +1745,9 @@ class VoiceClient:
                     proc.wait(timeout=1.0)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+            # Always re-seat HFP after TTS so wake can hear again.
+            if (os.getenv("BT_DEVICE_MAC") or os.getenv("BT_MAC") or "").strip():
+                self._restore_hfp_audio()
 
     def _watch_barge_in(
         self,
