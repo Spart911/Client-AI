@@ -172,6 +172,9 @@ class VoiceClient:
             self.oww_threshold,
         )
         self._configure_audio_device()
+        # Bluetooth HFP SCO often arrives wedged after reboot/TTS — reseat before listen.
+        if (os.getenv("BT_DEVICE_MAC") or os.getenv("BT_MAC") or "").strip():
+            self._restore_hfp_audio()
         self._warmup_backend()
         self._init_wake()
         self._sync_volume_from_backend()
@@ -201,12 +204,15 @@ class VoiceClient:
             self._stop_music()
             self._last_wake_ts = time.monotonic()
             logger.info("Wake detected — capturing command")
-            # One-shot «Джарвис какая погода»: command already trails the wake
-            # in preroll — skip the chime so we don't eat the utterance.
+            # Always ack wake with a short non-blocking chirp (paplay on HFP).
+            # Do not block recording — continuous «Джарвис + команда» keeps going.
             if self._preroll_still_speaking(preroll):
-                logger.info("Speech already in preroll — skip listen cue")
-            else:
-                self._play_listen_cue()
+                logger.info("Speech already in preroll — listen cue non-blocking")
+            threading.Thread(
+                target=self._play_listen_cue,
+                name="listen-cue",
+                daemon=True,
+            ).start()
             interrupted = False
             while True:
                 wav_bytes = self._record_until_silence(
@@ -232,7 +238,11 @@ class VoiceClient:
                     time.sleep(self.wake_cooldown_sec)
                     break
                 logger.info("Barge-in — capturing new command")
-                self._play_listen_cue()
+                threading.Thread(
+                    target=self._play_listen_cue,
+                    name="listen-cue",
+                    daemon=True,
+                ).start()
 
     def _configure_audio_device(self) -> None:
         """Pick sounddevice input/output; log what PortAudio sees (Pulse/ALSA)."""
@@ -1145,21 +1155,44 @@ class VoiceClient:
             return b""
         return self._frames_to_wav(audio)
 
-    def _play_listen_cue(self) -> None:
-        """Short pleasant chime: assistant is listening for the command."""
+    def _play_chime_array(self, audio: np.ndarray) -> None:
+        """Play a short chime via paplay (HFP-safe); fall back to sounddevice."""
+        audio = (audio * self._assistant_gain()).astype(np.float32, copy=False)
+        paplay = shutil.which("paplay")
+        if paplay:
+            fd, tmp_name = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            path = Path(tmp_name)
+            try:
+                self._write_wav_pcm(path, audio, SAMPLE_RATE)
+                subprocess.run(
+                    [paplay, str(path)],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                )
+            except Exception:
+                logger.debug("paplay chime failed", exc_info=True)
+            finally:
+                path.unlink(missing_ok=True)
+            return
         try:
-            audio = self._make_listen_chime(SAMPLE_RATE) * self._assistant_gain()
             sd.play(audio, SAMPLE_RATE, blocking=True)
-            # Let the room settle so the chime isn't captured as speech.
-            time.sleep(0.12)
+        except Exception:
+            logger.debug("sounddevice chime failed", exc_info=True)
+
+    def _play_listen_cue(self) -> None:
+        """Short pleasant chime: assistant heard the wake / is listening."""
+        try:
+            self._play_chime_array(self._make_listen_chime(SAMPLE_RATE))
         except Exception:
             logger.debug("Listen cue playback failed", exc_info=True)
 
     def _play_sent_cue(self) -> None:
         """Different chime: listening finished, request is being sent."""
         try:
-            audio = self._make_sent_chime(SAMPLE_RATE) * self._assistant_gain()
-            sd.play(audio, SAMPLE_RATE, blocking=True)
+            self._play_chime_array(self._make_sent_chime(SAMPLE_RATE))
         except Exception:
             logger.debug("Sent cue playback failed", exc_info=True)
 
