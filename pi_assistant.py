@@ -1501,12 +1501,34 @@ class VoiceClient:
         except Exception:
             pass
 
+    def _write_wav_pcm(self, path: Path, data: np.ndarray, rate: int) -> None:
+        """Write float32 mono/stereo [-1,1] as 16-bit PCM WAV."""
+        pcm = np.clip(data, -1.0, 1.0)
+        if pcm.ndim == 1:
+            channels = 1
+            flat = pcm
+        else:
+            channels = int(pcm.shape[1])
+            flat = pcm.reshape(-1)
+        with wave.open(str(path), "wb") as wav:
+            wav.setnchannels(channels)
+            wav.setsampwidth(2)
+            wav.setframerate(rate)
+            wav.writeframes((flat * 32767.0).astype(np.int16).tobytes())
+
     def _play_wav(self, wav_bytes: bytes, reply_text: str = "") -> np.ndarray | None:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp.write(wav_bytes)
-            path = Path(tmp.name)
+        """
+        Play TTS reply.
+
+        On Bluetooth HFP, PortAudio duplex (sd.play + InputStream) often deadlocks
+        Pulse — the client then hangs right after «Listening for microWakeWord»
+        during barge-in. Prefer paplay for output and keep sounddevice for mic only.
+        """
+        fd, tmp_name = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        path = Path(tmp_name)
         try:
-            with wave.open(str(path), "rb") as wav:
+            with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
                 rate = wav.getframerate()
                 frames = wav.readframes(wav.getnframes())
                 width = wav.getsampwidth()
@@ -1520,7 +1542,10 @@ class VoiceClient:
 
             # Master assistant volume (1–10) applies to spoken replies too.
             data = data * self._assistant_gain()
-            # Trailing silence — ALSA underruns often clip the last syllable.
+            if self.barge_in:
+                # Duck the reply so bleed stays below a normal speaking voice.
+                data = data * BARGE_PLAYBACK_GAIN
+            # Trailing silence — ALSA/Pulse underruns often clip the last syllable.
             pad_n = int(rate * TTS_END_PAD_SEC)
             if pad_n > 0:
                 if data.ndim == 1:
@@ -1535,25 +1560,73 @@ class VoiceClient:
                         ]
                     )
 
-            if not self.barge_in:
-                sd.play(data, rate)
-                sd.wait()
-                return None
+            duration = float(data.shape[0]) / float(rate)
+            self._write_wav_pcm(path, data, rate)
+            logger.info(
+                "Playing reply (%.1fs, barge_in=%s)",
+                duration,
+                "on" if self.barge_in else "off",
+            )
 
-            # Duck the reply so bleed stays below a normal speaking voice at any
-            # system volume — energy gates alone cannot outrun the speakers.
-            data = data * BARGE_PLAYBACK_GAIN
-            duration = len(data) / float(rate)
+            paplay = shutil.which("paplay")
+            if paplay:
+                return self._play_wav_paplay(
+                    paplay, path, duration, reply_text=reply_text
+                )
+
+            # Fallback: never open mic while PortAudio output is active (HFP hang).
+            if self.barge_in:
+                logger.warning(
+                    "paplay not found — TTS without barge-in (avoids HFP deadlock)"
+                )
             sd.play(data, rate)
-            try:
-                preroll = self._watch_barge_in(reply_text, duration)
-            finally:
-                sd.stop()
-            if preroll is not None:
-                logger.info("Barge-in detected — playback stopped")
-            return preroll
+            sd.wait()
+            return None
         finally:
             path.unlink(missing_ok=True)
+
+    def _play_wav_paplay(
+        self,
+        paplay: str,
+        path: Path,
+        duration: float,
+        reply_text: str = "",
+    ) -> np.ndarray | None:
+        """Play via Pulse paplay; optional barge-in uses sounddevice mic only."""
+        proc = subprocess.Popen(
+            [paplay, str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        preroll: np.ndarray | None = None
+        try:
+            if self.barge_in:
+                preroll = self._watch_barge_in(reply_text, duration)
+                if preroll is not None:
+                    logger.info("Barge-in detected — playback stopped")
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=1.5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    return preroll
+            try:
+                proc.wait(timeout=max(2.0, duration + 2.0))
+            except subprocess.TimeoutExpired:
+                logger.warning("paplay still running after %.1fs — killing", duration)
+                proc.kill()
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
+            return None
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
 
     def _watch_barge_in(
         self,
