@@ -46,6 +46,8 @@ KEEPALIVE_SEC="${BT_KEEPALIVE_SEC:-120}"
 KEEPALIVE_VOL="${BT_KEEPALIVE_VOL:-3500}"  # paplay 0..65536; ~5% — soft but present
 KEEPALIVE_WAV="${BT_KEEPALIVE_WAV:-/tmp/voice-bt-keepalive-v2.wav}"
 _last_keepalive_ts=0
+LOG_FILE="${BT_LOG_FILE:-${SCRIPT_DIR}/logs/bt-connect.log}"
+mkdir -p "$(dirname "${LOG_FILE}")"
 
 if [[ -z "${MAC}" ]]; then
   echo "BT_DEVICE_MAC is not set. Put it in .env, e.g.:" >&2
@@ -59,7 +61,11 @@ mac_norm="$(echo "${MAC}" | tr '[:lower:]' '[:upper:]' | tr -d ' ')"
 card_id="bluez_card.$(echo "${mac_norm}" | tr ':' '_')"
 
 log() {
-  echo "$(date -Iseconds) bt-connect: $*"
+  local line
+  line="$(date -Iseconds) bt-connect: $*"
+  echo "${line}"
+  # File log survives RPi volatile journal (40-rpi-volatile-storage.conf).
+  echo "${line}" >> "${LOG_FILE}" 2>/dev/null || true
 }
 
 bt_connected() {

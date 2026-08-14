@@ -68,6 +68,8 @@ MUSIC_LISTEN_DUCK = 0.35
 MUSIC_SPEECH_DUCK = 0.12
 # Gate over music bleed (slightly softer than TTS barge-in).
 MUSIC_GATE_MULT = 1.08
+# Sentinel: music ended mid-listen — reopen InputStream after HFP reseat.
+_REOPEN_MIC = object()
 
 DEFAULT_OWW_MODEL = "alexa"
 # HFP Bluetooth mics are quiet/noisy — 0.5 is too strict at room distance.
@@ -500,25 +502,29 @@ class VoiceClient:
             sys.exit(1)
 
     def _wait_for_wake(self) -> np.ndarray | None:
-        if self._wake_mode == "mww":
-            self._in_wake_listen = True
-            try:
-                return self._wait_mww(
-                    echo_gate=self._is_music_playing(),
-                    music_duck=True,
-                )
-            finally:
-                self._in_wake_listen = False
-        if self._wake_mode == "oww":
-            self._in_wake_listen = True
-            try:
-                return self._wait_oww(
-                    echo_gate=self._is_music_playing(),
-                    music_duck=True,
-                )
-            finally:
-                self._in_wake_listen = False
-        raise RuntimeError("Wake engine is not initialized")
+        if self._wake_mode not in ("mww", "oww"):
+            raise RuntimeError("Wake engine is not initialized")
+        self._in_wake_listen = True
+        try:
+            # echo_gate starts False; sync_music_duck toggles it when mpv starts.
+            # Reopen the mic stream after music ends so HFP SCO is not stale.
+            while True:
+                if self._wake_mode == "mww":
+                    result = self._wait_mww(
+                        echo_gate=False,
+                        music_duck=True,
+                    )
+                else:
+                    result = self._wait_oww(
+                        echo_gate=False,
+                        music_duck=True,
+                    )
+                if result is _REOPEN_MIC:
+                    logger.info("Reopening mic after music (HFP reseat)")
+                    continue
+                return result
+        finally:
+            self._in_wake_listen = False
 
     def _wait_mww(
         self,
@@ -529,6 +535,7 @@ class VoiceClient:
         echo_gate: bool = False,
         stable_frames: int | None = None,
         music_duck: bool = False,
+        barge_soft: bool = False,
     ) -> np.ndarray | None:
         from collections import deque
 
@@ -546,6 +553,7 @@ class VoiceClient:
         use_gate = bool(echo_gate)
         music_mode = False
         speech_ducked = False
+        reopen_after_music = False
         # Idle: keep ~2.8s so «Джарвис какая погода» keeps the command tail.
         preroll: deque[np.ndarray] = deque(maxlen=4 if use_gate else 35)
         floor_window: deque[float] = deque(maxlen=16)
@@ -566,7 +574,7 @@ class VoiceClient:
 
         def sync_music_duck() -> None:
             nonlocal use_gate, music_mode, speech_ducked, preroll
-            nonlocal stable, feeding, quiet_frames
+            nonlocal stable, feeding, quiet_frames, reopen_after_music
             if not music_duck:
                 return
             playing = self._is_music_playing()
@@ -583,12 +591,26 @@ class VoiceClient:
                 self._mww.reset()
                 self._mww_features.reset()
                 self._duck_music(MUSIC_LISTEN_DUCK)
+                logger.info(
+                    "Music on — duck×%.2f + soft wake scoring over bleed",
+                    MUSIC_LISTEN_DUCK,
+                )
             elif not playing and music_mode:
                 music_mode = False
                 speech_ducked = False
-                if not echo_gate:
-                    use_gate = False
-                    preroll = deque(preroll, maxlen=35)
+                use_gate = False
+                preroll = deque(preroll, maxlen=35)
+                floor_window.clear()
+                pre_burst_f.clear()
+                feeding = False
+                quiet_frames = 0
+                stable = 0
+                self._mww.reset()
+                self._mww_features.reset()
+                # Always reseat HFP after mpv — SCO often dies like after TTS.
+                self._restore_hfp_audio()
+                reopen_after_music = True
+                logger.info("Music off — cleared wake gate, restored HFP")
 
         def set_feeding(active: bool) -> None:
             nonlocal feeding, quiet_frames, speech_ducked, stable
@@ -633,6 +655,8 @@ class VoiceClient:
                     if deadline is not None and time.monotonic() >= deadline:
                         return None
                     sync_music_duck()
+                    if reopen_after_music:
+                        return _REOPEN_MIC
                     try:
                         chunk = q.get(timeout=0.25)
                     except queue.Empty:
@@ -647,7 +671,12 @@ class VoiceClient:
                     peak_energy = max(peak_energy, frame_energy)
 
                     if use_gate:
-                        gate_mult = MUSIC_GATE_MULT if music_mode else self.barge_energy_mult
+                        if barge_soft:
+                            gate_mult = BARGE_MULT_MIN
+                        elif music_mode:
+                            gate_mult = MUSIC_GATE_MULT
+                        else:
+                            gate_mult = self.barge_energy_mult
                         gate = self._echo_gate(floor_window, threshold, mult=gate_mult)
                         loud = gate is not None and frame_energy >= gate
                         if not loud and not feeding:
@@ -673,7 +702,10 @@ class VoiceClient:
                                 stable = 0
                         if not feeding:
                             pre_burst_f.append(frame_f.copy())
-                            continue
+                            # Music / soft barge: still score wake under the gate —
+                            # HFP SCO often keeps speech energy below bleed.
+                            if not barge_soft and not music_mode:
+                                continue
                         preroll.append(frame_f.copy())
                     else:
                         preroll.append(frame_f.copy())
@@ -701,37 +733,50 @@ class VoiceClient:
                         abs(best_score - last_score_log) >= 0.05
                     ):
                         logger.info(
-                            "MWW score %.3f energy=%.4f (need ≥%.2f)",
+                            "MWW score %.3f energy=%.4f (need ≥%.2f)%s",
                             best_score,
                             frame_energy,
                             score_limit,
+                            " [music]" if music_mode else (
+                                " [barge-soft]" if barge_soft else ""
+                            ),
                         )
                         last_score_log = best_score
 
                     if now - last_heartbeat >= 5.0:
                         logger.info(
-                            "Mic heartbeat: rms=%.5f peak_rms=%.5f mww=%.3f peak_score=%.3f frames=%d",
+                            "Mic heartbeat: rms=%.5f peak_rms=%.5f mww=%.3f peak_score=%.3f frames=%d%s",
                             frame_energy,
                             peak_energy,
                             best_score,
                             peak_score,
                             frames_seen,
+                            " [music]" if music_mode else "",
                         )
                         last_heartbeat = now
                         peak_energy = 0.0
                         peak_score = 0.0
 
-                    if best_score >= score_limit:
+                    # Soft barge / music: accept a strong wake even below the energy gate.
+                    score_ok = best_score >= score_limit
+                    if (barge_soft or music_mode) and best_score >= max(
+                        score_limit, 0.72
+                    ):
+                        score_ok = True
+                    if score_ok:
                         stable += 1
                     else:
                         stable = 0
 
                     if stable >= stable_needed:
                         logger.info(
-                            "Wake matched (mww): %s score=%.3f energy=%.3f",
+                            "Wake matched (mww): %s score=%.3f energy=%.3f%s",
                             self._mww_wake_word or "mww",
                             best_score,
                             frame_energy,
+                            " (music)" if music_mode else (
+                                " (barge)" if barge_soft else ""
+                            ),
                         )
                         return self._preroll_array(preroll)
         finally:
@@ -772,6 +817,7 @@ class VoiceClient:
         use_gate = bool(echo_gate)
         music_mode = False
         speech_ducked = False
+        reopen_after_music = False
         # ~1.5 s of float audio after wake for a trailing command fragment.
         # Idle: keep ~2.8s so «Джарвис какая погода» keeps the command tail.
         preroll: deque[np.ndarray] = deque(maxlen=4 if use_gate else 35)
@@ -793,7 +839,7 @@ class VoiceClient:
 
         def sync_music_duck() -> None:
             nonlocal use_gate, music_mode, speech_ducked, preroll
-            nonlocal stable, feeding, quiet_frames
+            nonlocal stable, feeding, quiet_frames, reopen_after_music
             if not music_duck:
                 return
             playing = self._is_music_playing()
@@ -810,15 +856,23 @@ class VoiceClient:
                 self._oww.reset()
                 self._duck_music(MUSIC_LISTEN_DUCK)
                 logger.info(
-                    "Music on — duck×%.2f + speech gate for wake listen",
+                    "Music on — duck×%.2f + soft wake scoring over bleed",
                     MUSIC_LISTEN_DUCK,
                 )
             elif not playing and music_mode:
                 music_mode = False
                 speech_ducked = False
-                if not echo_gate:
-                    use_gate = False
-                    preroll = deque(preroll, maxlen=35)
+                use_gate = False
+                preroll = deque(preroll, maxlen=35)
+                floor_window.clear()
+                pre_burst_f.clear()
+                feeding = False
+                quiet_frames = 0
+                stable = 0
+                self._oww.reset()
+                self._restore_hfp_audio()
+                reopen_after_music = True
+                logger.info("Music off — cleared wake gate, restored HFP")
 
         def set_feeding(active: bool) -> None:
             nonlocal feeding, quiet_frames, speech_ducked, stable
@@ -870,6 +924,8 @@ class VoiceClient:
                     if deadline is not None and time.monotonic() >= deadline:
                         return None
                     sync_music_duck()
+                    if reopen_after_music:
+                        return _REOPEN_MIC
                     try:
                         chunk = q.get(timeout=0.25)
                     except queue.Empty:
@@ -928,7 +984,9 @@ class VoiceClient:
                                 stable = 0
                         if not feeding:
                             pre_burst_f.append(frame_f.copy())
-                            continue
+                            # During music still score wake under the bleed gate.
+                            if not music_mode:
+                                continue
                         preroll.append(frame_f.copy())
                     else:
                         preroll.append(frame_f.copy())
@@ -962,13 +1020,14 @@ class VoiceClient:
                     now = time.monotonic()
                     if now - last_heartbeat >= 5.0:
                         logger.info(
-                            "Mic heartbeat: rms=%.5f peak_rms=%.5f oww=%s=%.3f peak_score=%.3f frames=%d",
+                            "Mic heartbeat: rms=%.5f peak_rms=%.5f oww=%s=%.3f peak_score=%.3f frames=%d%s",
                             frame_energy,
                             peak_energy,
                             best_name or (self._oww_labels[0] if self._oww_labels else "?"),
                             best_score,
                             peak_score,
                             frames_seen,
+                            " [music]" if music_mode else "",
                         )
                         last_heartbeat = now
                         peak_energy = 0.0
@@ -977,10 +1036,11 @@ class VoiceClient:
                         abs(best_score - last_score_log) >= 0.05
                     ):
                         logger.info(
-                            "OWW score %s=%.3f energy=%.4f",
+                            "OWW score %s=%.3f energy=%.4f%s",
                             best_name,
                             best_score,
                             frame_energy,
+                            " [music]" if music_mode else "",
                         )
                         last_score_log = best_score
 
@@ -989,6 +1049,7 @@ class VoiceClient:
                     energy_ok = (
                         frame_energy >= min(threshold * 0.35, 0.001)
                         or best_score >= score_limit
+                        or music_mode
                     )
                     if best_score >= score_limit and energy_ok:
                         stable += 1
@@ -997,10 +1058,11 @@ class VoiceClient:
 
                     if stable >= stable_needed:
                         logger.info(
-                            "Wake matched (oww): %s score=%.3f energy=%.3f",
+                            "Wake matched (oww): %s score=%.3f energy=%.3f%s",
                             best_name or self.oww_model,
                             best_score,
                             frame_energy,
+                            " (music)" if music_mode else "",
                         )
                         return self._preroll_array(preroll)
         finally:
@@ -1604,10 +1666,15 @@ class VoiceClient:
                 self._music_proc.send_signal(signal.SIGSTOP)
 
     def _stop_music(self) -> None:
+        had_proc = False
         with self._music_lock:
+            had_proc = self._music_proc is not None
             self._current_track_id = ""
             self._current_source = ""
             self._terminate_music_proc()
+        # mpv on HFP often wedges the SCO mic — same as after TTS.
+        if had_proc and (os.getenv("BT_DEVICE_MAC") or os.getenv("BT_MAC") or "").strip():
+            self._restore_hfp_audio()
 
     def _terminate_music_proc(self) -> None:
         proc = self._music_proc
@@ -1678,6 +1745,9 @@ class VoiceClient:
             if self.barge_in:
                 # Duck the reply so bleed stays below a normal speaking voice.
                 data = data * BARGE_PLAYBACK_GAIN
+                if self._bluez_sink_active():
+                    # Extra duck on HFP so barge-in mic can clear TTS bleed.
+                    data = data * 0.75
             # Trailing silence — ALSA/Pulse underruns often clip the last syllable.
             pad_n = int(rate * TTS_END_PAD_SEC)
             if pad_n > 0:
@@ -1837,12 +1907,15 @@ class VoiceClient:
         duration: float,
         reply_text: str = "",
     ) -> np.ndarray | None:
-        """Play via Pulse paplay; barge-in only when not on Bluetooth HFP."""
-        # Concurrent mic capture during paplay on HFP often kills the SCO mic
-        # afterwards («unstuck but can't hear»). Keep barge-in for non-BT sinks.
-        use_barge = self.barge_in and not self._bluez_sink_active()
-        if self.barge_in and not use_barge:
-            logger.info("Barge-in deferred on Bluetooth HFP (keeps mic alive)")
+        """Play via Pulse paplay; listen for barge-in on the mic in parallel."""
+        on_bt = self._bluez_sink_active()
+        use_barge = self.barge_in
+        if use_barge:
+            logger.info(
+                "Barge-in armed during TTS (bt=%s, %.1fs)",
+                "yes" if on_bt else "no",
+                duration,
+            )
 
         proc = subprocess.Popen(
             [paplay, str(path)],
@@ -1878,7 +1951,7 @@ class VoiceClient:
                     proc.wait(timeout=1.0)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-            # Always re-seat HFP after TTS so wake can hear again.
+            # Always re-seat HFP after TTS so wake/mic survive duplex SCO use.
             if (os.getenv("BT_DEVICE_MAC") or os.getenv("BT_MAC") or "").strip():
                 self._restore_hfp_audio()
 
@@ -1892,7 +1965,12 @@ class VoiceClient:
         # Accept on the idle energy floor — the echo gate handles bleed separately.
         # Raising this with the speakers made high-volume barge-in impossible.
         threshold = self.energy_threshold
-        # Energy gate + OWW score replace Vosk echo-text filtering.
+        on_bt = self._bluez_sink_active()
+        # HFP SCO is poor duplex: TTS bleed is weak/noisy and a strict echo gate
+        # often blocks real «Джарвис». Soften gate on Bluetooth.
+        if on_bt:
+            threshold = max(0.0008, threshold * 0.55)
+        # Energy gate + OWW/MWW score replace Vosk echo-text filtering.
         _ = reply_text
         if self._wake_mode == "mww":
             return self._wait_mww(
@@ -1901,6 +1979,7 @@ class VoiceClient:
                 respect_cooldown=False,
                 echo_gate=True,
                 stable_frames=1,
+                barge_soft=on_bt,
             )
         if self._wake_mode == "oww":
             return self._wait_oww(
