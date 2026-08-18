@@ -42,6 +42,12 @@ RUN chmod +x /tmp/install-oww-runtime.sh \
     && bash /tmp/install-oww-runtime.sh \
     && rm -f /tmp/install-oww-runtime.sh
 
+# Classic Xiph RNNoise v0.1.1 (small GRU). Separate layer so pip cache survives.
+COPY scripts/install-rnnoise.sh /tmp/install-rnnoise.sh
+RUN chmod +x /tmp/install-rnnoise.sh \
+    && bash /tmp/install-rnnoise.sh \
+    && rm -f /tmp/install-rnnoise.sh
+
 COPY asound.conf /etc/asound.conf
 COPY pi_assistant.py .
 COPY models ./models

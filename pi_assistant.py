@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
+import ctypes.util
 import io
 import json
 import logging
@@ -26,6 +28,7 @@ import tempfile
 import threading
 import time
 import wave
+from collections import deque
 from pathlib import Path
 
 import httpx
@@ -56,9 +59,9 @@ BARGE_ONSET_FRAMES = 2
 BARGE_COMMAND_WAIT_SEC = 5.0
 # After silence is detected, keep a short pad so word endings aren't clipped.
 RECORD_END_PAD_SEC = 0.12
-# Don't end on silence until this long into the capture (HFP listen-chime
-# briefly mutes the mic — otherwise we get listen-beep then instant sent-beep).
-RECORD_MIN_SEC = 1.8
+# If the wake preroll already counts as speech, wait this long for the actual
+# command before ending on silence (USB mic is not muted by the listen ding).
+RECORD_MIN_SEC = 0.9
 # Quiet tail after TTS so ALSA/Pulse underruns don't eat the last syllable.
 TTS_END_PAD_SEC = 0.35
 # While waiting for wake with music on: keep mpv quieter so speech
@@ -81,12 +84,38 @@ DEFAULT_WAKE_ENGINE = "oww"
 DEFAULT_NOISE_HP_HZ = 280.0
 
 
+def _load_librnnoise() -> ctypes.CDLL:
+    """Load Xiph librnnoise (Debian: librnnoise0)."""
+    candidates = [
+        ctypes.util.find_library("rnnoise"),
+        "librnnoise.so.0",
+        "librnnoise.so",
+        "/usr/lib/arm-linux-gnueabihf/librnnoise.so.0",
+        "/usr/lib/aarch64-linux-gnu/librnnoise.so.0",
+        "/usr/lib/x86_64-linux-gnu/librnnoise.so.0",
+    ]
+    seen: set[str] = set()
+    last_error: OSError | None = None
+    for name in candidates:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        try:
+            return ctypes.CDLL(name)
+        except OSError as exc:
+            last_error = exc
+    raise FileNotFoundError(
+        last_error or "librnnoise not found (install package librnnoise0)"
+    )
+
+
 class MicDenoise:
     """
     Lightweight mic cleanup for Pi + HFP: high-pass + adaptive soft gate.
 
     Cuts low rumble (cars/windows) and attenuates steady background when it
     sits near the noise floor. Cheap enough for every 80–100 ms frame.
+    Fallback when RNNoise/librnnoise is unavailable.
     """
 
     def __init__(self, rate: int = SAMPLE_RATE, hp_hz: float = DEFAULT_NOISE_HP_HZ) -> None:
@@ -94,6 +123,7 @@ class MicDenoise:
 
         self.rate = rate
         self.hp_hz = float(np.clip(hp_hz, 80.0, 800.0))
+        self.label = f"highpass={self.hp_hz:.0f}Hz + soft gate"
         self._sos = butter(2, self.hp_hz, btype="highpass", fs=rate, output="sos")
         self._zi = sosfilt_zi(self._sos) * 0.0
         self.noise_rms = 0.008
@@ -128,6 +158,116 @@ class MicDenoise:
         return np.clip(y, -1.0, 1.0)
 
 
+class RnnoiseDenoise:
+    """
+    Xiph RNNoise on 10 ms / 48 kHz frames, with a light high-pass in front.
+
+    Incoming 16 kHz float frames are resampled, denoised, then returned at
+    16 kHz. State is kept across calls so the GRU sees a continuous stream.
+    """
+
+    FRAME = 480
+    MODEL_RATE = 48000
+
+    def __init__(self, rate: int = SAMPLE_RATE, hp_hz: float = DEFAULT_NOISE_HP_HZ) -> None:
+        from scipy.signal import butter, sosfilt_zi
+
+        self.rate = int(rate)
+        self.hp_hz = float(np.clip(hp_hz, 80.0, 800.0))
+        self.label = f"RNNoise + highpass={self.hp_hz:.0f}Hz"
+        self._sos = butter(2, self.hp_hz, btype="highpass", fs=self.rate, output="sos")
+        self._zi = sosfilt_zi(self._sos) * 0.0
+        self._buf48 = np.zeros(0, dtype=np.float32)
+        self._pending16 = np.zeros(0, dtype=np.float32)
+        self._lib = _load_librnnoise()
+        self._lib.rnnoise_create.restype = ctypes.c_void_p
+        self._lib.rnnoise_create.argtypes = [ctypes.c_void_p]
+        self._lib.rnnoise_destroy.argtypes = [ctypes.c_void_p]
+        self._lib.rnnoise_process_frame.restype = ctypes.c_float
+        self._lib.rnnoise_process_frame.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float),
+        ]
+        self._st = self._lib.rnnoise_create(None)
+        if not self._st:
+            raise RuntimeError("rnnoise_create failed")
+
+    def reset(self) -> None:
+        from scipy.signal import sosfilt_zi
+
+        self._zi = sosfilt_zi(self._sos) * 0.0
+        self._buf48 = np.zeros(0, dtype=np.float32)
+        self._pending16 = np.zeros(0, dtype=np.float32)
+        if self._st:
+            self._lib.rnnoise_destroy(self._st)
+        self._st = self._lib.rnnoise_create(None)
+        if not self._st:
+            raise RuntimeError("rnnoise_create failed")
+
+    def close(self) -> None:
+        if getattr(self, "_st", None):
+            self._lib.rnnoise_destroy(self._st)
+            self._st = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def process(self, frame: np.ndarray) -> np.ndarray:
+        from scipy.signal import resample_poly, sosfilt
+
+        x = frame.astype(np.float32, copy=False)
+        if x.size == 0:
+            return x
+        y, self._zi = sosfilt(self._sos, x, zi=self._zi)
+        y = np.asarray(y, dtype=np.float32)
+        x48 = np.asarray(
+            resample_poly(y, self.MODEL_RATE, self.rate),
+            dtype=np.float32,
+        )
+        self._buf48 = np.concatenate([self._buf48, x48]) if self._buf48.size else x48
+        out48: list[np.ndarray] = []
+        while self._buf48.size >= self.FRAME:
+            chunk = np.ascontiguousarray(
+                self._buf48[: self.FRAME] * 32768.0,
+                dtype=np.float32,
+            )
+            self._buf48 = self._buf48[self.FRAME :]
+            ptr = chunk.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+            self._lib.rnnoise_process_frame(self._st, ptr, ptr)
+            out48.append(chunk * (1.0 / 32768.0))
+        if not out48:
+            return np.clip(y, -1.0, 1.0)
+        y48 = np.concatenate(out48)
+        y16 = np.asarray(
+            resample_poly(y48, self.rate, self.MODEL_RATE),
+            dtype=np.float32,
+        )
+        if self._pending16.size:
+            y16 = np.concatenate([self._pending16, y16])
+        if y16.size >= x.size:
+            self._pending16 = y16[x.size :]
+            y16 = y16[: x.size]
+        else:
+            y16 = np.pad(y16, (0, x.size - y16.size))
+            self._pending16 = np.zeros(0, dtype=np.float32)
+        return np.clip(y16, -1.0, 1.0)
+
+
+def create_mic_denoise(rate: int, hp_hz: float):
+    """Prefer RNNoise; fall back to high-pass + gate."""
+    engine = (os.getenv("NOISE_ENGINE") or "rnnoise").strip().lower()
+    if engine in ("rnnoise", "rnn", "auto"):
+        try:
+            return RnnoiseDenoise(rate, hp_hz)
+        except Exception:
+            logger.warning("RNNoise unavailable — using high-pass + gate", exc_info=True)
+    return MicDenoise(rate, hp_hz)
+
+
 class VoiceClient:
     """Hands-free Raspberry Pi client for the voice-assistant backend."""
 
@@ -135,7 +275,7 @@ class VoiceClient:
         self,
         backend_url: str,
         wake_words: list[str] | None = None,
-        silence_sec: float = 0.6,
+        silence_sec: float = 0.35,
         max_utterance_sec: float = 20.0,
         energy_threshold: float = 0.01,
         wake_engine: str = DEFAULT_WAKE_ENGINE,
@@ -164,10 +304,10 @@ class VoiceClient:
         self.mpv_command = (mpv_command or "").strip() or shutil.which("mpv") or "mpv"
         self.audio_device = audio_device
         self.noise_suppress = bool(noise_suppress)
-        self._denoise: MicDenoise | None = None
+        self._denoise: MicDenoise | RnnoiseDenoise | None = None
         if self.noise_suppress:
             try:
-                self._denoise = MicDenoise(SAMPLE_RATE, hp_hz=noise_hp_hz)
+                self._denoise = create_mic_denoise(SAMPLE_RATE, hp_hz=noise_hp_hz)
             except Exception:
                 logger.warning("Mic denoise unavailable — continuing without it", exc_info=True)
                 self.noise_suppress = False
@@ -236,10 +376,7 @@ class VoiceClient:
             self.oww_threshold,
         )
         if self._denoise is not None:
-            logger.info(
-                "Mic denoise: on (highpass=%.0fHz + soft gate)",
-                self._denoise.hp_hz,
-            )
+            logger.info("Mic denoise: %s", self._denoise.label)
         else:
             logger.info("Mic denoise: off")
         self._configure_audio_device()
@@ -275,32 +412,20 @@ class VoiceClient:
             self._stop_music()
             self._last_wake_ts = time.monotonic()
             logger.info("Wake detected — capturing command")
-            # Always ack wake with a short non-blocking chirp (paplay on HFP).
-            # Do not block recording — continuous «Джарвис + команда» keeps going.
             if self._preroll_still_speaking(preroll):
-                logger.info("Speech already in preroll — listen cue non-blocking")
-            threading.Thread(
-                target=self._play_listen_cue,
-                name="listen-cue",
-                daemon=True,
-            ).start()
+                logger.info("Speech already in preroll — listen cue during capture")
             interrupted = False
             while True:
                 wav_bytes = self._record_until_silence(
                     preroll=preroll,
                     require_speech=interrupted,
                     start_timeout_sec=BARGE_COMMAND_WAIT_SEC,
+                    play_listen_cue=True,
                 )
                 if not wav_bytes:
                     if not interrupted:
                         logger.warning("Empty recording, back to wake listen")
                     break
-                # Non-blocking cue: start upload immediately, chime in background.
-                threading.Thread(
-                    target=self._play_sent_cue,
-                    name="sent-cue",
-                    daemon=True,
-                ).start()
                 preroll = self._assist_and_play(wav_bytes)
                 self._last_wake_ts = time.monotonic()
                 interrupted = preroll is not None
@@ -309,14 +434,10 @@ class VoiceClient:
                     time.sleep(self.wake_cooldown_sec)
                     break
                 logger.info("Barge-in — capturing new command")
-                threading.Thread(
-                    target=self._play_listen_cue,
-                    name="listen-cue",
-                    daemon=True,
-                ).start()
 
     def _configure_audio_device(self) -> None:
         """Pick sounddevice input/output; log what PortAudio sees (Pulse/ALSA)."""
+        self._ensure_usb_pulse()
         try:
             devices = sd.query_devices()
         except Exception:
@@ -366,9 +487,10 @@ class VoiceClient:
 
         if "," in text:
             left, right = text.split(",", 1)
-            inp = int(left) if left.strip().isdigit() else None
-            out = int(right) if right.strip().isdigit() else None
-            return (inp, out)
+            return (
+                VoiceClient._match_device(left, devices, want_input=True),
+                VoiceClient._match_device(right, devices, want_input=False),
+            )
 
         needle = text.lower()
         input_match = None
@@ -385,6 +507,75 @@ class VoiceClient:
             logger.warning("AUDIO_INPUT_DEVICE=%r matched no devices", text)
             return None
         return (input_match, output_match)
+
+    @staticmethod
+    def _match_device(needle: str, devices, *, want_input: bool) -> int | None:
+        text = needle.strip().lower()
+        if not text:
+            return None
+        if text.isdigit():
+            idx = int(text)
+            return idx if 0 <= idx < len(devices) else None
+        for index, info in enumerate(devices):
+            name = str(info.get("name", "")).lower()
+            if text not in name:
+                continue
+            key = "max_input_channels" if want_input else "max_output_channels"
+            if info.get(key, 0) > 0:
+                return index
+        return None
+
+    def _ensure_usb_pulse(self) -> None:
+        """Keep USB mic on Pulse analog-mono (needed after a previous 'off')."""
+        if not shutil.which("pactl"):
+            return
+        try:
+            cards = subprocess.check_output(
+                ["pactl", "list", "cards", "short"],
+                text=True,
+                timeout=3,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            return
+        for line in cards.splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            name = parts[1]
+            lowered = name.lower()
+            if "usb" not in lowered:
+                continue
+            if not any(token in lowered for token in ("c-media", "pnp_sound", "pcm2902")):
+                continue
+            result = subprocess.run(
+                ["pactl", "set-card-profile", name, "input:analog-mono"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            if result.returncode == 0:
+                logger.info("Pulse USB card %s → analog-mono", name)
+                usb_src = (os.getenv("PULSE_DEFAULT_SOURCE") or "").strip()
+                if usb_src:
+                    subprocess.run(
+                        ["pactl", "set-default-source", usb_src],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=3,
+                    )
+                    mic_vol = (os.getenv("USB_MIC_VOLUME") or "100%").strip()
+                    if mic_vol:
+                        subprocess.run(
+                            ["pactl", "set-source-volume", usb_src, mic_vol],
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=3,
+                        )
+                        logger.info("USB mic volume %s → %s", usb_src, mic_vol)
 
     def _warmup_backend(self) -> None:
         try:
@@ -425,13 +616,18 @@ class VoiceClient:
             self._mww = MicroWakeWord.from_config(config_path)
             self._mww_features = MicroWakeWordFeatures()
             self._mww_wake_word = getattr(self._mww, "wake_word", "mww")
-            # If threshold is explicit in env/CLI, override trainer default.
+            # Trainer default is cutoff 0.9 over 10 frames — too strict for a
+            # room USB mic. Override both from env.
             self._mww.probability_cutoff = self.oww_threshold
+            window = max(1, int(os.getenv("MWW_WINDOW", "10")))
+            self._mww.sliding_window_size = window
+            self._mww._probabilities = deque(maxlen=window)
             self._wake_mode = "mww"
             logger.info(
-                "microWakeWord ready: wake=%s cutoff=%.2f config=%s",
+                "microWakeWord ready: wake=%s cutoff=%.2f window=%d config=%s",
                 self._mww_wake_word,
                 self._mww.probability_cutoff,
+                window,
                 config_path,
             )
         except Exception as exc:
@@ -566,6 +762,7 @@ class VoiceClient:
         peak_energy = 0.0
         peak_score = 0.0
         frames_seen = 0
+        recent_energy: deque[float] = deque(maxlen=16)
 
         def callback(indata, frames, time_info, status) -> None:  # noqa: ARG001
             if status:
@@ -632,10 +829,11 @@ class VoiceClient:
                 speech_ducked = False
 
         logger.info(
-            "Listening for microWakeWord %s (score≥%.2f, stable≥%d)",
+            "Listening for microWakeWord %s (score≥%.2f, stable≥%d, window=%d)",
             self._mww_wake_word or "mww",
             score_limit,
             stable_needed,
+            int(getattr(self._mww, "sliding_window_size", 1)),
         )
 
         try:
@@ -663,12 +861,18 @@ class VoiceClient:
                         continue
                     mono = chunk.reshape(-1).astype(np.int16, copy=False)
                     frame_f = mono.astype(np.float32) / 32768.0
+                    peak = float(np.max(np.abs(frame_f)) or 0.0)
+                    if peak > 0.35:
+                        frame_f = frame_f * (0.35 / peak)
                     if self._denoise is not None:
                         frame_f = self._denoise.process(frame_f)
+                        mono = np.clip(frame_f * 32768.0, -32768, 32767).astype(np.int16)
+                    else:
                         mono = np.clip(frame_f * 32768.0, -32768, 32767).astype(np.int16)
                     frame_energy = self._rms(frame_f)
                     frames_seen += 1
                     peak_energy = max(peak_energy, frame_energy)
+                    recent_energy.append(frame_energy)
 
                     if use_gate:
                         if barge_soft:
@@ -729,13 +933,13 @@ class VoiceClient:
                     peak_score = max(peak_score, best_score)
 
                     now = time.monotonic()
-                    if best_score >= max(0.12, score_limit * 0.25) and (
-                        abs(best_score - last_score_log) >= 0.05
+                    if best_score >= 0.08 and (
+                        abs(best_score - last_score_log) >= 0.04
                     ):
                         logger.info(
                             "MWW score %.3f energy=%.4f (need ≥%.2f)%s",
                             best_score,
-                            frame_energy,
+                            max(recent_energy) if recent_energy else frame_energy,
                             score_limit,
                             " [music]" if music_mode else (
                                 " [barge-soft]" if barge_soft else ""
@@ -773,7 +977,7 @@ class VoiceClient:
                             "Wake matched (mww): %s score=%.3f energy=%.3f%s",
                             self._mww_wake_word or "mww",
                             best_score,
-                            frame_energy,
+                            max(recent_energy) if recent_energy else frame_energy,
                             " (music)" if music_mode else (
                                 " (barge)" if barge_soft else ""
                             ),
@@ -1224,6 +1428,7 @@ class VoiceClient:
         preroll: np.ndarray | None = None,
         require_speech: bool = False,
         start_timeout_sec: float | None = None,
+        play_listen_cue: bool = False,
     ) -> bytes:
         """
         Record one utterance: preroll + mic until silence_sec of quiet.
@@ -1243,6 +1448,8 @@ class VoiceClient:
         frames: list[np.ndarray] = []
         silent = 0
         started = False
+        heard_live = False
+        sent_cued = False
 
         if preroll is not None and preroll.size:
             lead.append(preroll.astype(np.float32, copy=False))
@@ -1255,17 +1462,23 @@ class VoiceClient:
             dtype="float32",
             blocksize=block,
         ) as stream:
+            if play_listen_cue:
+                # A2DP drops the ding if we play in the same instant capture opens.
+                time.sleep(0.28)
+                threading.Thread(
+                    target=self._play_listen_cue,
+                    name="listen-cue",
+                    daemon=True,
+                ).start()
             for index in range(max_blocks):
                 data, _ = stream.read(block)
                 mono = data[:, 0]
                 if self._denoise is not None:
                     mono = self._denoise.process(mono)
                 energy = self._rms(mono)
-                # paplay listen/sent chime on HFP often zeros the mic briefly.
-                if self._pulse_sink_busy():
-                    silent = 0
                 if energy >= self.energy_threshold:
                     started = True
+                    heard_live = True
                     silent = 0
                     frames.append(mono.copy())
                 elif started:
@@ -1275,7 +1488,11 @@ class VoiceClient:
                         silent = max(0, silent - 1)
                     else:
                         silent += 1
-                        if silent >= silence_blocks and index >= min_blocks:
+                        # End as soon as the command goes quiet. RECORD_MIN only
+                        # covers "Jarvis" in preroll with no live speech yet.
+                        can_end = heard_live or index >= min_blocks
+                        if silent >= silence_blocks and can_end:
+                            sent_cued = True
                             break
                 else:
                     frames.append(mono.copy())
@@ -1290,6 +1507,16 @@ class VoiceClient:
                 for _ in range(pad_blocks):
                     data, _ = stream.read(block)
                     frames.append(data[:, 0].copy())
+                sent_cued = True
+
+        # Play sent ding only after capture is closed — A2DP eats it while
+        # the USB/Pulse InputStream is still open.
+        if sent_cued:
+            threading.Thread(
+                target=self._play_sent_cue,
+                name="sent-cue",
+                daemon=True,
+            ).start()
 
         if require_speech and not started:
             logger.info("No command after the barge-in — back to wake listen")
@@ -1317,46 +1544,122 @@ class VoiceClient:
             return False
         return bool(out.strip())
 
-    def _play_chime_array(self, audio: np.ndarray) -> None:
-        """Play a short chime via paplay (HFP-safe); fall back to sounddevice."""
+    def _pulse_default_sink(self) -> str:
+        try:
+            return subprocess.check_output(
+                ["pactl", "get-default-sink"],
+                text=True,
+                timeout=2,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except Exception:
+            return ""
+
+    def _play_chime_array(
+        self,
+        audio: np.ndarray,
+        *,
+        drain_sec: float = 0.0,
+        audio_buffer: float = 0.2,
+    ) -> None:
+        """Play a short chime. Prefer mpv (already used for TTS/music on A2DP)."""
         audio = (audio * self._assistant_gain()).astype(np.float32, copy=False)
-        paplay = shutil.which("paplay")
-        if paplay:
-            fd, tmp_name = tempfile.mkstemp(suffix=".wav")
-            os.close(fd)
-            path = Path(tmp_name)
-            try:
-                self._write_wav_pcm(path, audio, SAMPLE_RATE)
-                subprocess.run(
-                    [paplay, str(path)],
+        duration = float(np.asarray(audio).shape[0]) / float(SAMPLE_RATE)
+        fd, tmp_name = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        path = Path(tmp_name)
+        try:
+            self._write_wav_pcm(path, audio, SAMPLE_RATE)
+            env = os.environ.copy()
+            env.setdefault("PULSE_LATENCY_MSEC", "200")
+            mpv = (self.mpv_command or "").strip() or shutil.which("mpv")
+            timeout = max(8.0, duration + drain_sec + 3.0)
+            buf = max(0.15, float(audio_buffer))
+            sink = self._pulse_default_sink()
+            if mpv:
+                cmd = [
+                    mpv,
+                    "--no-video",
+                    "--really-quiet",
+                    "--no-terminal",
+                    f"--audio-buffer={buf:.2f}",
+                    "--volume=100",
+                ]
+                if sink:
+                    cmd.append(f"--audio-device=pulse/{sink}")
+                cmd.append(str(path))
+                result = subprocess.run(
+                    cmd,
                     check=False,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    timeout=5,
+                    timeout=timeout,
+                    env=env,
                 )
-            except Exception:
-                logger.debug("paplay chime failed", exc_info=True)
-            finally:
-                path.unlink(missing_ok=True)
-            return
-        try:
+                if result.returncode != 0:
+                    logger.warning("mpv chime failed rc=%s", result.returncode)
+                if drain_sec > 0:
+                    time.sleep(drain_sec)
+                return
+            paplay = shutil.which("paplay")
+            if paplay:
+                cmd = [paplay]
+                sink = self._pulse_default_sink()
+                if sink:
+                    cmd.extend(["--device", sink])
+                cmd.append(str(path))
+                subprocess.run(
+                    cmd,
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=timeout,
+                    env=env,
+                )
+                if drain_sec > 0:
+                    time.sleep(drain_sec)
+                return
             sd.play(audio, SAMPLE_RATE, blocking=True)
+            if drain_sec > 0:
+                time.sleep(drain_sec)
         except Exception:
-            logger.debug("sounddevice chime failed", exc_info=True)
+            logger.warning("chime playback failed", exc_info=True)
+        finally:
+            path.unlink(missing_ok=True)
 
     def _play_listen_cue(self) -> None:
-        """Short pleasant chime: assistant heard the wake / is listening."""
+        """Original G5→C6 ding, padded so A2DP can prime and finish."""
         try:
-            self._play_chime_array(self._make_listen_chime(SAMPLE_RATE))
+            logger.info("Listen cue")
+            rate = SAMPLE_RATE
+            chime = self._make_listen_chime(rate)
+            primed = np.concatenate(
+                [
+                    np.zeros(int(rate * 0.20), dtype=np.float32),
+                    chime,
+                    np.zeros(int(rate * 0.55), dtype=np.float32),
+                ]
+            )
+            self._play_chime_array(primed, drain_sec=0.08, audio_buffer=0.35)
         except Exception:
-            logger.debug("Listen cue playback failed", exc_info=True)
+            logger.warning("Listen cue playback failed", exc_info=True)
 
     def _play_sent_cue(self) -> None:
         """Different chime: listening finished, request is being sent."""
         try:
-            self._play_chime_array(self._make_sent_chime(SAMPLE_RATE))
+            logger.info("Sent cue")
+            rate = SAMPLE_RATE
+            chime = self._make_sent_chime(rate)
+            primed = np.concatenate(
+                [
+                    np.zeros(int(rate * 0.12), dtype=np.float32),
+                    chime,
+                    np.zeros(int(rate * 0.45), dtype=np.float32),
+                ]
+            )
+            self._play_chime_array(primed, drain_sec=0.05, audio_buffer=0.30)
         except Exception:
-            logger.debug("Sent cue playback failed", exc_info=True)
+            logger.warning("Sent cue playback failed", exc_info=True)
 
     @staticmethod
     def _make_listen_chime(rate: int) -> np.ndarray:
@@ -1380,7 +1683,7 @@ class VoiceClient:
             [
                 tone(784.0, 0.11),   # G5
                 gap,
-                tone(1046.5, 0.16), # C6
+                tone(1046.5, 0.16),  # C6
                 np.zeros(int(rate * 0.05), dtype=np.float32),
             ]
         )
@@ -1815,6 +2118,19 @@ class VoiceClient:
         if not mac:
             return
         profile = (os.getenv("BT_PROFILE") or "handsfree_head_unit").strip()
+        usb_source = (os.getenv("PULSE_DEFAULT_SOURCE") or "").strip()
+        # USB mic + A2DP speaker: never bounce the card (that drops the speaker)
+        # and never steal default source back to Bluetooth HFP.
+        if profile == "a2dp_sink":
+            if usb_source and shutil.which("pactl"):
+                subprocess.run(
+                    ["pactl", "set-default-source", usb_source],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                )
+            return
         mac_us = mac.upper().replace(":", "_").replace("-", "_")
         card = f"bluez_card.{mac_us}"
         try:
@@ -2102,7 +2418,7 @@ def main() -> None:
     parser.add_argument(
         "--silence",
         type=float,
-        default=float(os.getenv("SILENCE_SEC", "0.6")),
+        default=float(os.getenv("SILENCE_SEC", "0.35")),
         help="Seconds of quiet before ending the command recording (default 0.6)",
     )
     parser.add_argument("--max-sec", type=float, default=20.0)
@@ -2170,7 +2486,7 @@ def main() -> None:
         dest="noise_suppress",
         action="store_true",
         default=os.getenv("NOISE_SUPPRESS", "true").lower() in ("1", "true", "yes"),
-        help="High-pass + soft noise gate on mic (default on)",
+        help="Mic denoise: RNNoise if available, else high-pass + gate (default on)",
     )
     parser.add_argument(
         "--no-noise-suppress",

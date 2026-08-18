@@ -11,5 +11,8 @@ build/
 
 # Local wake-word retrain workspace (features/TTS can be tens of GB)
 mww_retrain/
+record/
 _wtest
 logs/
+
+*.bak-v2

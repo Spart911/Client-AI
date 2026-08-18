@@ -125,9 +125,13 @@ pulse_defaults_ok() {
   def_sink="$(pactl get-default-sink 2>/dev/null || true)"
   def_source="$(pactl get-default-source 2>/dev/null || true)"
   [[ "${def_sink}" == *"${mac_us}"* ]] || return 1
-  if [[ "${PROFILE}" != "a2dp_sink" ]]; then
-    [[ "${def_source}" == *"${mac_us}"* ]] || return 1
+  if [[ "${PROFILE}" == "a2dp_sink" ]]; then
+    if [[ -n "${PULSE_DEFAULT_SOURCE:-}" ]]; then
+      [[ "${def_source}" == "${PULSE_DEFAULT_SOURCE}" ]] || return 1
+    fi
+    return 0
   fi
+  [[ "${def_source}" == *"${mac_us}"* ]] || return 1
   return 0
 }
 
@@ -181,7 +185,19 @@ apply_pulse() {
       pactl set-default-sink "${sink}" || true
     fi
   fi
-  if [[ -n "${source}" ]]; then
+  if [[ "${PROFILE}" == "a2dp_sink" ]]; then
+    local usb_source="${PULSE_DEFAULT_SOURCE:-}"
+    if [[ -n "${usb_source}" ]]; then
+      local def_source
+      def_source="$(pactl get-default-source 2>/dev/null || true)"
+      if [[ "${def_source}" != "${usb_source}" ]]; then
+        log "default source → ${usb_source} (USB, A2DP has no mic)"
+        pactl set-default-source "${usb_source}" || true
+      fi
+    else
+      log "A2DP has no mic — keep existing default source"
+    fi
+  elif [[ -n "${source}" ]]; then
     local def_source
     def_source="$(pactl get-default-source 2>/dev/null || true)"
     if [[ "${def_source}" != "${source}" ]]; then
@@ -192,8 +208,6 @@ apply_pulse() {
     if [[ -n "${mic_vol}" ]]; then
       pactl set-source-volume "${source}" "${mic_vol}" || true
     fi
-  elif [[ "${PROFILE}" == "a2dp_sink" ]]; then
-    log "A2DP has no mic — keep existing default source"
   fi
   return 0
 }
