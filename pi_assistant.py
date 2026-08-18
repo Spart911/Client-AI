@@ -47,6 +47,13 @@ FRAME_SAMPLES = 1280
 
 # Below this the barge-in gate sits at the speaker bleed level and lets it through.
 BARGE_MULT_MIN = 1.05
+# Open speaker (A2DP + USB mic): TTS bleed is ~real speech RMS. Voice must
+# clear a high percentile of that envelope, not the pre-play silence floor.
+BARGE_TTS_GATE_MULT = 1.50
+BARGE_TTS_PERCENTILE = 0.85
+BARGE_FLOOR_FRAMES = 24
+# Don't score wake until playback has a stable bleed floor.
+BARGE_ARM_SEC = 0.50
 # Soften the reply while we listen for an interrupt — leaves headroom for the
 # mic at any system volume (bleed scales with the speakers, the user's voice does not).
 BARGE_PLAYBACK_GAIN = 0.62
@@ -626,6 +633,7 @@ class VoiceClient:
         stable_frames: int | None = None,
         music_duck: bool = False,
         barge_soft: bool = False,
+        arm_sec: float = 0.0,
     ) -> np.ndarray | None:
         from collections import deque
 
@@ -647,7 +655,10 @@ class VoiceClient:
         reopen_after_music = False
         # Idle: keep ~2.8s so «Джарвис какая погода» keeps the command tail.
         preroll: deque[np.ndarray] = deque(maxlen=4 if use_gate else 35)
-        floor_window: deque[float] = deque(maxlen=16)
+        floor_len = BARGE_FLOOR_FRAMES if use_gate and not barge_soft else 16
+        floor_window: deque[float] = deque(maxlen=floor_len)
+        listen_started = time.monotonic()
+        open_echo = self._open_speaker_echo()
         pre_burst_f: deque[np.ndarray] = deque(maxlen=BARGE_ONSET_FRAMES)
         feeding = False
         quiet_frames = 0
@@ -665,7 +676,7 @@ class VoiceClient:
             q.put(indata.copy())
 
         def sync_music_duck() -> None:
-            nonlocal use_gate, music_mode, speech_ducked, preroll
+            nonlocal use_gate, music_mode, speech_ducked, preroll, floor_window
             nonlocal stable, feeding, quiet_frames, reopen_after_music
             if not music_duck:
                 return
@@ -674,7 +685,9 @@ class VoiceClient:
                 music_mode = True
                 use_gate = True
                 preroll = deque(preroll, maxlen=4)
-                floor_window.clear()
+                floor_window = deque(
+                    maxlen=BARGE_FLOOR_FRAMES if open_echo else 16
+                )
                 pre_burst_f.clear()
                 feeding = False
                 quiet_frames = 0
@@ -684,8 +697,11 @@ class VoiceClient:
                 self._mww_features.reset()
                 self._duck_music(MUSIC_LISTEN_DUCK)
                 logger.info(
-                    "Music on — duck×%.2f + soft wake scoring over bleed",
+                    "Music on — duck×%.2f + %s",
                     MUSIC_LISTEN_DUCK,
+                    "open-echo gate (don't score speaker bleed)"
+                    if open_echo
+                    else "soft wake scoring over bleed",
                 )
             elif not playing and music_mode:
                 music_mode = False
@@ -724,12 +740,15 @@ class VoiceClient:
                 speech_ducked = False
 
         logger.info(
-            "Listening for microWakeWord %s (score≥%.2f, stable≥%d, window=%d, energy≥%.3f)",
+            "Listening for microWakeWord %s (score≥%.2f, stable≥%d, window=%d, energy≥%.3f%s)",
             self._mww_wake_word or "mww",
             score_limit,
             stable_needed,
             int(getattr(self._mww, "sliding_window_size", 1)),
             self.wake_accept_energy,
+            ", open-echo" if (use_gate and open_echo and not barge_soft) else (
+                ", barge-soft" if barge_soft else ""
+            ),
         )
 
         try:
@@ -771,15 +790,43 @@ class VoiceClient:
                     recent_energy.append(frame_energy)
 
                     if use_gate:
+                        # HFP headset: weak bleed, score under the gate.
+                        # Open speaker: TTS/music in the room IS the floor —
+                        # never treat that envelope as a barge-in.
+                        track_playback = (not barge_soft) and (
+                            use_gate and (open_echo or not music_mode)
+                        )
                         if barge_soft:
                             gate_mult = BARGE_MULT_MIN
-                        elif music_mode:
+                            gate_pct = 0.75
+                            gate_min = 3
+                        elif music_mode and not open_echo:
                             gate_mult = MUSIC_GATE_MULT
+                            gate_pct = 0.75
+                            gate_min = 3
                         else:
-                            gate_mult = self.barge_energy_mult
-                        gate = self._echo_gate(floor_window, threshold, mult=gate_mult)
-                        loud = gate is not None and frame_energy >= gate
-                        if not loud and not feeding:
+                            gate_mult = BARGE_TTS_GATE_MULT
+                            gate_pct = BARGE_TTS_PERCENTILE
+                            gate_min = 8
+                        if track_playback:
+                            floor_window.append(frame_energy)
+                        gate = self._echo_gate(
+                            floor_window,
+                            threshold,
+                            mult=gate_mult,
+                            percentile=gate_pct,
+                            min_frames=gate_min,
+                        )
+                        armed_yet = (
+                            arm_sec <= 0.0
+                            or (time.monotonic() - listen_started) >= arm_sec
+                        )
+                        loud = (
+                            armed_yet
+                            and gate is not None
+                            and frame_energy >= gate
+                        )
+                        if not track_playback and not loud and not feeding:
                             floor_window.append(frame_energy)
                         if loud:
                             quiet_frames = 0
@@ -802,9 +849,10 @@ class VoiceClient:
                                 stable = 0
                         if not feeding:
                             pre_burst_f.append(frame_f.copy())
-                            # Music / soft barge: still score wake under the gate —
-                            # HFP SCO often keeps speech energy below bleed.
-                            if not barge_soft and not music_mode:
+                            score_under_gate = barge_soft or (
+                                music_mode and not open_echo
+                            )
+                            if not score_under_gate:
                                 continue
                         preroll.append(frame_f.copy())
                     else:
@@ -858,12 +906,23 @@ class VoiceClient:
                         peak_score = 0.0
 
                     accept_energy = self.wake_accept_energy
-                    if barge_soft or music_mode:
+                    if barge_soft or (music_mode and not open_echo):
                         accept_energy = max(0.006, accept_energy * 0.5)
                     burst_ok, burst_peak, burst_floor = self._wake_burst_ok(
                         recent_energy, accept_energy
                     )
-                    score_ok = best_score >= score_limit and burst_ok
+                    if (
+                        use_gate
+                        and not barge_soft
+                        and floor_window
+                        and burst_ok
+                    ):
+                        play_floor = sorted(floor_window)[len(floor_window) // 2]
+                        if play_floor > 1e-6 and burst_peak < play_floor * BARGE_TTS_GATE_MULT:
+                            burst_ok = False
+                            burst_floor = play_floor
+                    armed = arm_sec <= 0.0 or (now - listen_started) >= arm_sec
+                    score_ok = best_score >= score_limit and burst_ok and armed
                     if best_score >= score_limit and not burst_ok:
                         if abs(best_score - last_score_log) >= 0.04:
                             logger.info(
@@ -888,7 +947,7 @@ class VoiceClient:
                             best_score,
                             max(recent_energy) if recent_energy else frame_energy,
                             " (music)" if music_mode else (
-                                " (barge)" if barge_soft else ""
+                                " (barge)" if use_gate else ""
                             ),
                         )
                         return self._preroll_array(preroll)
@@ -907,6 +966,8 @@ class VoiceClient:
         threshold: float,
         *,
         mult: float | None = None,
+        percentile: float = 0.75,
+        min_frames: int = 3,
     ) -> float | None:
         """
         Energy a voice must beat to be heard over our own playback.
@@ -916,10 +977,11 @@ class VoiceClient:
         a peak×margin gate rises with the speaker volume until a normal voice
         can no longer clear it. Playback is also ducked while we listen.
         """
-        if len(window) < 3:
+        if len(window) < max(3, min_frames):
             return None
         ordered = sorted(window)
-        index = min(len(ordered) - 1, int(len(ordered) * 0.75))
+        frac = min(0.95, max(0.5, float(percentile)))
+        index = min(len(ordered) - 1, int(len(ordered) * frac))
         factor = self.barge_energy_mult if mult is None else max(BARGE_MULT_MIN, mult)
         return max(threshold, ordered[index] * factor)
 
@@ -1833,7 +1895,7 @@ class VoiceClient:
             if self.barge_in:
                 # Duck the reply so bleed stays below a normal speaking voice.
                 data = data * BARGE_PLAYBACK_GAIN
-                if self._bluez_sink_active():
+                if self._hfp_duplex():
                     # Extra duck on HFP so barge-in mic can clear TTS bleed.
                     data = data * 0.75
             # Trailing silence — ALSA/Pulse underruns often clip the last syllable.
@@ -1876,6 +1938,9 @@ class VoiceClient:
         finally:
             path.unlink(missing_ok=True)
 
+    def _bt_profile(self) -> str:
+        return (os.getenv("BT_PROFILE") or "handsfree_head_unit").strip().lower()
+
     def _bluez_sink_active(self) -> bool:
         if not shutil.which("pactl"):
             return False
@@ -1889,6 +1954,17 @@ class VoiceClient:
         except Exception:
             return False
         return "bluez" in sink.lower()
+
+    def _open_speaker_echo(self) -> bool:
+        """True when a room speaker plays into a separate mic (A2DP + USB)."""
+        if self._bt_profile() == "a2dp_sink":
+            return True
+        source = (os.getenv("PULSE_DEFAULT_SOURCE") or "").strip().lower()
+        return "usb" in source
+
+    def _hfp_duplex(self) -> bool:
+        """Same Bluetooth headset for mic and speaker (weak acoustic echo)."""
+        return self._bt_profile() != "a2dp_sink" and self._bluez_sink_active()
 
     def _restore_hfp_audio(self) -> None:
         """
@@ -2009,12 +2085,13 @@ class VoiceClient:
         reply_text: str = "",
     ) -> np.ndarray | None:
         """Play via Pulse paplay; listen for barge-in on the mic in parallel."""
-        on_bt = self._bluez_sink_active()
+        open_echo = self._open_speaker_echo()
+        hfp = self._hfp_duplex()
         use_barge = self.barge_in
         if use_barge:
             logger.info(
-                "Barge-in armed during TTS (bt=%s, %.1fs)",
-                "yes" if on_bt else "no",
+                "Barge-in armed during TTS (%s, %.1fs)",
+                "open-echo" if open_echo else ("hfp-soft" if hfp else "local"),
                 duration,
             )
 
@@ -2064,13 +2141,20 @@ class VoiceClient:
         """Watch the mic while TTS plays; non-None result means «interrupt me»."""
         deadline = time.monotonic() + duration + 0.2
         # Accept on the idle energy floor — the echo gate handles bleed separately.
-        # Raising this with the speakers made high-volume barge-in impossible.
         threshold = self.energy_threshold
-        on_bt = self._bluez_sink_active()
+        open_echo = self._open_speaker_echo()
+        hfp = self._hfp_duplex()
         # HFP SCO is poor duplex: TTS bleed is weak/noisy and a strict echo gate
-        # often blocks real «Джарвис». Soften gate on Bluetooth.
-        if on_bt:
+        # often blocks real «Джарвис». Soften only on a headset mic, never when
+        # a room speaker dumps the reply back into a USB mic.
+        barge_soft = hfp and not open_echo
+        if barge_soft:
             threshold = max(0.0008, threshold * 0.55)
+            stable_frames = 1
+            arm_sec = 0.0
+        else:
+            stable_frames = max(WAKE_STABLE_MIN, self.wake_stable_frames)
+            arm_sec = BARGE_ARM_SEC
         # Energy gate + MWW score replace Vosk echo-text filtering.
         _ = reply_text
         return self._wait_mww(
@@ -2078,8 +2162,9 @@ class VoiceClient:
             energy_threshold=threshold,
             respect_cooldown=False,
             echo_gate=True,
-            stable_frames=1,
-            barge_soft=on_bt,
+            stable_frames=stable_frames,
+            barge_soft=barge_soft,
+            arm_sec=arm_sec,
         )
 
     def _trim_utterance(self, frames: np.ndarray) -> np.ndarray:
