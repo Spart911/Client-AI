@@ -56,9 +56,6 @@ BARGE_ONSET_FRAMES = 2
 BARGE_COMMAND_WAIT_SEC = 5.0
 # After silence is detected, keep a short pad so word endings aren't clipped.
 RECORD_END_PAD_SEC = 0.12
-# If the wake preroll already counts as speech, wait this long for the actual
-# command before ending on silence (USB mic is not muted by the listen ding).
-RECORD_MIN_SEC = 0.9
 # Quiet tail after TTS so ALSA/Pulse underruns don't eat the last syllable.
 TTS_END_PAD_SEC = 0.35
 # While waiting for wake with music on: keep mpv quieter so speech
@@ -319,6 +316,7 @@ class VoiceClient:
         self._last_wake_ts = 0.0
         self._music_proc: subprocess.Popen | None = None
         self._music_lock = threading.Lock()
+        self._cue_lock = threading.Lock()
         self._music_stop = threading.Event()
         self._current_track_id = ""
         self._current_source = ""
@@ -368,15 +366,13 @@ class VoiceClient:
             self._stop_music()
             self._last_wake_ts = time.monotonic()
             logger.info("Wake detected — capturing command")
-            if self._preroll_still_speaking(preroll):
-                logger.info("Speech already in preroll — listen cue during capture")
             interrupted = False
             while True:
                 wav_bytes = self._record_until_silence(
                     preroll=preroll,
                     require_speech=interrupted,
                     start_timeout_sec=BARGE_COMMAND_WAIT_SEC,
-                    play_listen_cue=True,
+                    play_listen_cue=not interrupted,
                 )
                 if not wav_bytes:
                     if not interrupted:
@@ -876,13 +872,6 @@ class VoiceClient:
             return None
         return np.concatenate(list(preroll))
 
-    def _preroll_still_speaking(self, preroll: np.ndarray | None) -> bool:
-        """True if the wake preroll's tail still looks like live speech."""
-        if preroll is None or preroll.size < int(SAMPLE_RATE * 0.12):
-            return False
-        tail = preroll[-int(SAMPLE_RATE * 0.3) :]
-        return self._rms(tail) >= max(self.energy_threshold * 0.35, 0.0008)
-
     def _echo_gate(
         self,
         window,
@@ -1021,6 +1010,7 @@ class VoiceClient:
     def _header_text(self, response: httpx.Response, name: str) -> str:
         """Decode UTF-8 text from X-{name}-B64 (fallback to legacy X-{name})."""
         return self._header_map_text(dict(response.headers), name)
+
     def _record_until_silence(
         self,
         preroll: np.ndarray | None = None,
@@ -1031,28 +1021,31 @@ class VoiceClient:
         """
         Record one utterance: preroll + mic until silence_sec of quiet.
 
+        Preroll is kept for overlap («Джарвис какая погода»), but it must not
+        start the end-of-speech clock — otherwise the listen ding is still
+        playing while we already send.
+
         require_speech waits for fresh speech instead of trusting the preroll —
-        after a barge-in the preroll is loud from our own reply, and without it
-        we would ship the wake phrase alone as the command.
+        after a barge-in the preroll is loud from our own reply.
         """
         block = int(SAMPLE_RATE * 0.1)
-        silence_blocks = int(self.silence_sec / 0.1)
+        silence_blocks = max(1, int(self.silence_sec / 0.1))
         max_blocks = int(self.max_utterance_sec / 0.1)
-        wait_blocks = int((start_timeout_sec or self.max_utterance_sec) / 0.1)
-        min_blocks = max(1, int(RECORD_MIN_SEC / 0.1))
-        # Soft floor so quiet word endings don't count as silence immediately.
+        wait_sec = start_timeout_sec or self.max_utterance_sec
+        if play_listen_cue:
+            wait_sec = max(float(wait_sec), 8.0)
+        wait_blocks = int(wait_sec / 0.1)
         continue_threshold = self.energy_threshold * 0.4
         lead: list[np.ndarray] = []
         frames: list[np.ndarray] = []
         silent = 0
-        started = False
         heard_live = False
-        sent_cued = False
+        listen_thread: threading.Thread | None = None
+        listen_done = threading.Event()
+        listen_done.set()
 
         if preroll is not None and preroll.size:
             lead.append(preroll.astype(np.float32, copy=False))
-            if not require_speech and self._rms(preroll) >= self.energy_threshold * 0.5:
-                started = True
 
         with sd.InputStream(
             samplerate=SAMPLE_RATE,
@@ -1061,13 +1054,22 @@ class VoiceClient:
             blocksize=block,
         ) as stream:
             if play_listen_cue:
-                # A2DP drops the ding if we play in the same instant capture opens.
-                time.sleep(0.28)
-                threading.Thread(
-                    target=self._play_listen_cue,
+                # Capture-open glitch on A2DP: a short settle, then ding.
+                time.sleep(0.12)
+                listen_done.clear()
+
+                def _run_listen_cue() -> None:
+                    try:
+                        self._play_listen_cue()
+                    finally:
+                        listen_done.set()
+
+                listen_thread = threading.Thread(
+                    target=_run_listen_cue,
                     name="listen-cue",
                     daemon=True,
-                ).start()
+                )
+                listen_thread.start()
             for index in range(max_blocks):
                 data, _ = stream.read(block)
                 mono = data[:, 0]
@@ -1075,49 +1077,47 @@ class VoiceClient:
                     mono = self._denoise.process(mono)
                 energy = self._rms(mono)
                 if energy >= self.energy_threshold:
-                    started = True
                     heard_live = True
                     silent = 0
                     frames.append(mono.copy())
-                elif started:
+                elif heard_live:
                     frames.append(mono.copy())
                     if energy >= continue_threshold:
-                        # Soft speech / trailing consonants — don't rush to end.
                         silent = max(0, silent - 1)
                     else:
                         silent += 1
-                        # End as soon as the command goes quiet. RECORD_MIN only
-                        # covers "Jarvis" in preroll with no live speech yet.
-                        can_end = heard_live or index >= min_blocks
-                        if silent >= silence_blocks and can_end:
-                            sent_cued = True
+                        # Wait until the listen ding finished, otherwise the
+                        # user is still waiting to speak and we ship "Jarvis".
+                        if silent >= silence_blocks and listen_done.is_set():
                             break
                 else:
                     frames.append(mono.copy())
                     if len(frames) > 5:
                         frames.pop(0)
-                    if require_speech and index >= wait_blocks:
+                    if listen_done.is_set() and index >= wait_blocks:
                         break
 
-            # Extra quiet pad after end-of-utterance so last syllables survive.
-            if started:
+            if heard_live:
                 pad_blocks = max(1, int(RECORD_END_PAD_SEC / 0.1))
                 for _ in range(pad_blocks):
                     data, _ = stream.read(block)
                     frames.append(data[:, 0].copy())
-                sent_cued = True
 
-        # Play sent ding only after capture is closed — A2DP eats it while
-        # the USB/Pulse InputStream is still open.
-        if sent_cued:
+        if listen_thread is not None:
+            listen_thread.join(timeout=3.0)
+
+        if heard_live:
             threading.Thread(
                 target=self._play_sent_cue,
                 name="sent-cue",
                 daemon=True,
             ).start()
 
-        if require_speech and not started:
-            logger.info("No command after the barge-in — back to wake listen")
+        if not heard_live:
+            logger.info(
+                "No command after %s — back to wake listen",
+                "barge-in" if require_speech else "wake",
+            )
             return b""
         chunks = lead + frames
         if not chunks:
@@ -1126,21 +1126,6 @@ class VoiceClient:
         if audio.size == 0:
             return b""
         return self._frames_to_wav(audio)
-
-    def _pulse_sink_busy(self) -> bool:
-        """True if something (chime/TTS/music) is currently playing via Pulse."""
-        if not shutil.which("pactl"):
-            return False
-        try:
-            out = subprocess.check_output(
-                ["pactl", "list", "short", "sink-inputs"],
-                text=True,
-                timeout=1,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            return False
-        return bool(out.strip())
 
     def _pulse_default_sink(self) -> str:
         try:
@@ -1225,100 +1210,91 @@ class VoiceClient:
         finally:
             path.unlink(missing_ok=True)
 
-    def _play_listen_cue(self) -> None:
-        """Original G5→C6 ding, padded so A2DP can prime and finish."""
+    def _play_cue(
+        self,
+        audio: np.ndarray,
+        *,
+        pre_sec: float,
+        post_sec: float,
+        label: str,
+    ) -> None:
         try:
-            logger.info("Listen cue")
+            logger.info(label)
             rate = SAMPLE_RATE
-            chime = self._make_listen_chime(rate)
             primed = np.concatenate(
                 [
-                    np.zeros(int(rate * 0.20), dtype=np.float32),
-                    chime,
-                    np.zeros(int(rate * 0.55), dtype=np.float32),
+                    np.zeros(max(0, int(rate * pre_sec)), dtype=np.float32),
+                    audio,
+                    np.zeros(max(0, int(rate * post_sec)), dtype=np.float32),
                 ]
             )
-            self._play_chime_array(primed, drain_sec=0.08, audio_buffer=0.35)
+            with self._cue_lock:
+                self._play_chime_array(primed, drain_sec=0.02, audio_buffer=0.18)
         except Exception:
-            logger.warning("Listen cue playback failed", exc_info=True)
+            logger.warning("%s playback failed", label, exc_info=True)
+
+    def _play_listen_cue(self) -> None:
+        self._play_cue(
+            self._make_chime(SAMPLE_RATE, 784.0, 0.11, 1046.5, 0.16),
+            pre_sec=0.05,
+            post_sec=0.18,
+            label="Listen cue",
+        )
 
     def _play_sent_cue(self) -> None:
-        """Different chime: listening finished, request is being sent."""
-        try:
-            logger.info("Sent cue")
-            rate = SAMPLE_RATE
-            chime = self._make_sent_chime(rate)
-            primed = np.concatenate(
-                [
-                    np.zeros(int(rate * 0.12), dtype=np.float32),
-                    chime,
-                    np.zeros(int(rate * 0.45), dtype=np.float32),
-                ]
-            )
-            self._play_chime_array(primed, drain_sec=0.05, audio_buffer=0.30)
-        except Exception:
-            logger.warning("Sent cue playback failed", exc_info=True)
+        self._play_cue(
+            self._make_chime(SAMPLE_RATE, 880.0, 0.09, 659.3, 0.14, amplitude=0.20, harm=0.12),
+            pre_sec=0.04,
+            post_sec=0.16,
+            label="Sent cue",
+        )
 
     @staticmethod
-    def _make_listen_chime(rate: int) -> np.ndarray:
-        """Soft two-tone 'listening' ding (~320ms), ascending."""
-        def tone(freq: float, duration: float, amplitude: float = 0.22) -> np.ndarray:
-            n = max(1, int(rate * duration))
-            t = np.arange(n, dtype=np.float32) / float(rate)
-            attack = min(n, int(rate * 0.02))
-            release = min(n, int(rate * 0.08))
-            env = np.ones(n, dtype=np.float32)
-            if attack > 0:
-                env[:attack] = np.linspace(0.0, 1.0, attack, dtype=np.float32)
-            if release > 0:
-                env[-release:] = np.linspace(1.0, 0.0, release, dtype=np.float32)
-            wave = np.sin(2.0 * np.pi * freq * t) * env * amplitude
-            wave += np.sin(4.0 * np.pi * freq * t) * env * (amplitude * 0.18)
-            return wave.astype(np.float32)
+    def _tone(
+        rate: int,
+        freq: float,
+        duration: float,
+        amplitude: float = 0.22,
+        attack: float = 0.02,
+        release: float = 0.08,
+        harm: float = 0.18,
+    ) -> np.ndarray:
+        n = max(1, int(rate * duration))
+        t = np.arange(n, dtype=np.float32) / float(rate)
+        att = min(n, int(rate * attack))
+        rel = min(n, int(rate * release))
+        env = np.ones(n, dtype=np.float32)
+        if att > 0:
+            env[:att] = np.linspace(0.0, 1.0, att, dtype=np.float32)
+        if rel > 0:
+            env[-rel:] = np.linspace(1.0, 0.0, rel, dtype=np.float32)
+        wave = np.sin(2.0 * np.pi * freq * t) * env * amplitude
+        wave += np.sin(4.0 * np.pi * freq * t) * env * (amplitude * harm)
+        return wave.astype(np.float32)
 
+    @classmethod
+    def _make_chime(
+        cls,
+        rate: int,
+        f1: float,
+        d1: float,
+        f2: float,
+        d2: float,
+        *,
+        amplitude: float = 0.22,
+        harm: float = 0.18,
+    ) -> np.ndarray:
         gap = np.zeros(int(rate * 0.04), dtype=np.float32)
         chime = np.concatenate(
             [
-                tone(784.0, 0.11),   # G5
+                cls._tone(rate, f1, d1, amplitude=amplitude, harm=harm),
                 gap,
-                tone(1046.5, 0.16),  # C6
-                np.zeros(int(rate * 0.05), dtype=np.float32),
+                cls._tone(rate, f2, d2, amplitude=amplitude, harm=harm),
             ]
         )
         peak = float(np.max(np.abs(chime)) or 1.0)
         if peak > 0.35:
             chime *= 0.35 / peak
-        return chime
-
-    @staticmethod
-    def _make_sent_chime(rate: int) -> np.ndarray:
-        """Soft two-tone 'sent' ding (~280ms), descending — distinct from listen."""
-        def tone(freq: float, duration: float, amplitude: float = 0.20) -> np.ndarray:
-            n = max(1, int(rate * duration))
-            t = np.arange(n, dtype=np.float32) / float(rate)
-            attack = min(n, int(rate * 0.015))
-            release = min(n, int(rate * 0.07))
-            env = np.ones(n, dtype=np.float32)
-            if attack > 0:
-                env[:attack] = np.linspace(0.0, 1.0, attack, dtype=np.float32)
-            if release > 0:
-                env[-release:] = np.linspace(1.0, 0.0, release, dtype=np.float32)
-            wave = np.sin(2.0 * np.pi * freq * t) * env * amplitude
-            wave += np.sin(4.0 * np.pi * freq * t) * env * (amplitude * 0.12)
-            return wave.astype(np.float32)
-
-        gap = np.zeros(int(rate * 0.03), dtype=np.float32)
-        chime = np.concatenate(
-            [
-                tone(880.0, 0.09),  # A5
-                gap,
-                tone(659.3, 0.14),  # E5 — lower confirmation
-                np.zeros(int(rate * 0.04), dtype=np.float32),
-            ]
-        )
-        peak = float(np.max(np.abs(chime)) or 1.0)
-        if peak > 0.32:
-            chime *= 0.32 / peak
         return chime
 
     def _start_music_poller(self) -> None:

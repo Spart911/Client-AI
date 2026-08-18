@@ -3,7 +3,7 @@ Description=Periodically update voice-client-pi from Git
 
 [Timer]
 OnBootSec=3min
-OnUnitActiveSec=30s
+OnCalendar=*-*-* *:*:00/30
 AccuracySec=1s
 Persistent=true
 
