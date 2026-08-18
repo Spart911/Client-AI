@@ -70,8 +70,14 @@ MUSIC_GATE_MULT = 1.08
 # Sentinel: music ended mid-listen — reopen InputStream after HFP reseat.
 _REOPEN_MIC = object()
 
-DEFAULT_WAKE_THRESHOLD = 0.85
+DEFAULT_WAKE_THRESHOLD = 0.90
 DEFAULT_MWW_CONFIG = "/app/models/ru_jarvis_mww.json"
+# Real «Джарвис» on the USB mic is ~0.02–0.03 RMS. False accepts sat at ~0.004.
+DEFAULT_WAKE_ACCEPT_ENERGY = 0.012
+# Peak in the recent window must also outrun the quiet floor.
+WAKE_ENERGY_BURST_RATIO = 2.5
+# Idle listen: at least this many 80 ms frames above score+energy.
+WAKE_STABLE_MIN = 3
 # High-pass in front of RNNoise (Hz).
 DEFAULT_NOISE_HP_HZ = 280.0
 
@@ -262,7 +268,8 @@ class VoiceClient:
         wake_threshold: float = DEFAULT_WAKE_THRESHOLD,
         mww_model_config: str = DEFAULT_MWW_CONFIG,
         wake_cooldown_sec: float = 2.0,
-        wake_stable_frames: int = 1,
+        wake_stable_frames: int = WAKE_STABLE_MIN,
+        wake_accept_energy: float = DEFAULT_WAKE_ACCEPT_ENERGY,
         barge_in: bool = True,
         barge_energy_mult: float = 1.12,
         device_id: str = "default",
@@ -299,8 +306,9 @@ class VoiceClient:
         self.max_utterance_sec = max_utterance_sec
         self.energy_threshold = energy_threshold
         self.wake_cooldown_sec = wake_cooldown_sec
-        # Consecutive 80 ms frames above threshold before accept.
+        # Consecutive 80 ms frames above score+energy before accept.
         self.wake_stable_frames = max(1, wake_stable_frames)
+        self.wake_accept_energy = max(0.001, float(wake_accept_energy))
         self.barge_in = barge_in
         # Headroom over the loudest bleed frame of our own reply. Keep it small:
         # normal speech sits barely above the reply's stressed syllables.
@@ -624,9 +632,10 @@ class VoiceClient:
         assert self._mww is not None
         assert self._mww_features is not None
         threshold = self.energy_threshold if energy_threshold is None else energy_threshold
-        stable_needed = (
-            self.wake_stable_frames if stable_frames is None else max(1, stable_frames)
-        )
+        if stable_frames is None:
+            stable_needed = max(WAKE_STABLE_MIN, self.wake_stable_frames)
+        else:
+            stable_needed = max(1, stable_frames)
         score_limit = float(self._mww.probability_cutoff)
 
         block = FRAME_SAMPLES
@@ -715,11 +724,12 @@ class VoiceClient:
                 speech_ducked = False
 
         logger.info(
-            "Listening for microWakeWord %s (score≥%.2f, stable≥%d, window=%d)",
+            "Listening for microWakeWord %s (score≥%.2f, stable≥%d, window=%d, energy≥%.3f)",
             self._mww_wake_word or "mww",
             score_limit,
             stable_needed,
             int(getattr(self._mww, "sliding_window_size", 1)),
+            self.wake_accept_energy,
         )
 
         try:
@@ -847,12 +857,25 @@ class VoiceClient:
                         peak_energy = 0.0
                         peak_score = 0.0
 
-                    # Soft barge / music: accept a strong wake even below the energy gate.
-                    score_ok = best_score >= score_limit
-                    if (barge_soft or music_mode) and best_score >= max(
-                        score_limit, 0.72
-                    ):
-                        score_ok = True
+                    accept_energy = self.wake_accept_energy
+                    if barge_soft or music_mode:
+                        accept_energy = max(0.006, accept_energy * 0.5)
+                    burst_ok, burst_peak, burst_floor = self._wake_burst_ok(
+                        recent_energy, accept_energy
+                    )
+                    score_ok = best_score >= score_limit and burst_ok
+                    if best_score >= score_limit and not burst_ok:
+                        if abs(best_score - last_score_log) >= 0.04:
+                            logger.info(
+                                "MWW hold %.3f energy=%.4f floor=%.4f "
+                                "(need energy≥%.3f and ≥%.1f×floor)",
+                                best_score,
+                                burst_peak,
+                                burst_floor,
+                                accept_energy,
+                                WAKE_ENERGY_BURST_RATIO,
+                            )
+                            last_score_log = best_score
                     if score_ok:
                         stable += 1
                     else:
@@ -2107,6 +2130,25 @@ class VoiceClient:
             return 0.0
         return float(np.sqrt(np.mean(np.square(frames.astype(np.float32)))))
 
+    @staticmethod
+    def _wake_burst_ok(
+        energies,
+        accept: float,
+    ) -> tuple[bool, float, float]:
+        """True if recent RMS looks like speech, not a flat noise floor."""
+        vals = [float(x) for x in energies]
+        if not vals:
+            return False, 0.0, 0.0
+        peak = max(vals)
+        body = vals[:-4] if len(vals) > 8 else vals
+        ordered = sorted(body)
+        floor = ordered[max(0, len(ordered) // 3)]
+        if peak < accept:
+            return False, peak, floor
+        if floor > 1e-6 and peak < floor * WAKE_ENERGY_BURST_RATIO:
+            return False, peak, floor
+        return True, peak, floor
+
     def _normalize(self, text: str) -> str:
         value = (text or "").lower().replace("ё", "е")
         value = re.sub(r"[^a-zа-я0-9_\s]+", " ", value)
@@ -2145,7 +2187,7 @@ def main() -> None:
         "--wake-threshold",
         type=float,
         default=_env_wake_threshold(),
-        help="Wake score threshold 0–1 (default 0.85; also reads OWW_THRESHOLD)",
+        help="Wake score threshold 0–1 (default 0.90; also reads OWW_THRESHOLD)",
     )
     parser.add_argument(
         "--mww-model-config",
@@ -2173,8 +2215,14 @@ def main() -> None:
     parser.add_argument(
         "--wake-stable",
         type=int,
-        default=int(os.getenv("WAKE_STABLE_FRAMES", "1")),
-        help="Consecutive 80ms frames above threshold before accept",
+        default=int(os.getenv("WAKE_STABLE_FRAMES", str(WAKE_STABLE_MIN))),
+        help="Consecutive 80ms frames above score+energy before accept (idle min 3)",
+    )
+    parser.add_argument(
+        "--wake-accept-energy",
+        type=float,
+        default=float(os.getenv("WAKE_ACCEPT_ENERGY", str(DEFAULT_WAKE_ACCEPT_ENERGY))),
+        help="Min RMS burst to accept a wake (rejects flat noise ~0.004)",
     )
     parser.add_argument(
         "--wake-cooldown",
@@ -2256,6 +2304,7 @@ def main() -> None:
         mww_model_config=args.mww_model_config,
         wake_cooldown_sec=args.wake_cooldown,
         wake_stable_frames=args.wake_stable,
+        wake_accept_energy=args.wake_accept_energy,
         barge_in=args.barge_in,
         barge_energy_mult=args.barge_energy_mult,
         device_id=args.device_id,
