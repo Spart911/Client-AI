@@ -108,8 +108,8 @@ Description=Periodically update voice-client-pi from Git
 
 [Timer]
 OnBootSec=3min
-OnUnitActiveSec=10min
-AccuracySec=1min
+OnUnitActiveSec=30s
+AccuracySec=1s
 Persistent=true
 
 [Install]

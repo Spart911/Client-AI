@@ -1,17 +1,15 @@
 # Raspberry Pi voice client — slim image for Pi 3B (arm/v7 or arm64)
-FROM python:3.11-slim-bookworm
+#
+# Builder has gcc/g++. Runtime keeps numpy/OpenBLAS, PortAudio, Pulse/mpv,
+# and RNNoise v0.1.1. Wake is microWakeWord only (bundled TFLite C lib).
+
+FROM python:3.11-slim-bookworm AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    # piwheels: prebuilt wheels for armv7 (Pi 3B 32-bit) — avoids compiling numpy/cffi
     PIP_EXTRA_INDEX_URL=https://www.piwheels.org/simple \
-    HOME=/home/pi \
-    OWW_MODEL=alexa \
-    # armv7: no onnxruntime → tflite (install-oww-runtime.sh)
-    OWW_FRAMEWORK=tflite \
-    PULSE_SERVER=unix:/run/user/1000/pulse/native \
-    XDG_RUNTIME_DIR=/run/user/1000
+    HOME=/home/pi
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       portaudio19-dev \
@@ -20,14 +18,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       pkg-config \
       libopenblas0 \
       libgfortran5 \
-      mpv \
-      alsa-utils \
-      libasound2-plugins \
-      libpulse0 \
-      pulseaudio-utils \
       ca-certificates \
       gcc \
       g++ \
+      wget \
+      autoconf \
+      automake \
+      libtool \
+      make \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd -g 29 audio 2>/dev/null || true \
@@ -36,18 +34,44 @@ RUN groupadd -g 29 audio 2>/dev/null || true \
 WORKDIR /app
 
 COPY requirements.txt .
-COPY scripts/install-oww-runtime.sh /tmp/install-oww-runtime.sh
-RUN chmod +x /tmp/install-oww-runtime.sh \
-    && pip install --upgrade pip \
-    && bash /tmp/install-oww-runtime.sh \
-    && rm -f /tmp/install-oww-runtime.sh
+RUN pip install --upgrade pip \
+    && pip install -r requirements.txt
 
-# Classic Xiph RNNoise v0.1.1 (small GRU). Separate layer so pip cache survives.
+# Classic Xiph RNNoise v0.1.1 (small GRU). Not master (~56MB model).
 COPY scripts/install-rnnoise.sh /tmp/install-rnnoise.sh
 RUN chmod +x /tmp/install-rnnoise.sh \
-    && bash /tmp/install-rnnoise.sh \
+    && RNNOISE_SKIP_APT=1 bash /tmp/install-rnnoise.sh \
     && rm -f /tmp/install-rnnoise.sh
 
+# ---------------------------------------------------------------------------
+FROM python:3.11-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HOME=/home/pi \
+    PULSE_SERVER=unix:/run/user/1000/pulse/native \
+    XDG_RUNTIME_DIR=/run/user/1000
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libportaudio2 \
+      libopenblas0 \
+      libgfortran5 \
+      mpv \
+      alsa-utils \
+      libasound2-plugins \
+      libpulse0 \
+      pulseaudio-utils \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -g 29 audio 2>/dev/null || true \
+    && useradd -m -u 1000 -G audio pi
+
+COPY --from=builder /usr/local /usr/local
+COPY --from=builder /opt/rnnoise-lib/ /usr/lib/
+RUN ldconfig
+
+WORKDIR /app
 COPY asound.conf /etc/asound.conf
 COPY pi_assistant.py .
 COPY models ./models

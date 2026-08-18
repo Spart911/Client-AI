@@ -1,19 +1,9 @@
 # Models
 
-Wake models are **not** vendored in git anymore.
+Vendored microWakeWord assets for «Джарвис»:
 
-At Docker build time the image runs:
+- `ru_jarvis_mww.tflite`
+- `ru_jarvis_mww.json` (`version: 3`)
 
-```python
-import openwakeword
-openwakeword.utils.download_models()
-```
-
-That fetches openWakeWord assets (mel / embedding / `alexa` and other pretrained heads) into the Python package directory.
-
-Default runtime wake: `OWW_MODEL=alexa` (`OWW_FRAMEWORK=tflite`).
-
-For custom Russian wake words (`interkelstar/microwakeword-trainer`):
-
-- Copy `<name>_mww.tflite` and `<name>_mww.json` into this `models/` directory.
-- Set `WAKE_ENGINE=mww` and `MWW_MODEL_CONFIG=/app/models/<name>_mww.json`.
+Runtime: `MWW_MODEL_CONFIG=/app/models/ru_jarvis_mww.json`.
+Threshold comes from `WAKE_THRESHOLD` (legacy alias: `OWW_THRESHOLD`).

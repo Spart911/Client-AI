@@ -1,0 +1,15 @@
+.git
+.venv
+.venv-oww
+__pycache__
+*.pyc
+.env
+*.wav
+.DS_Store
+mww_retrain
+record
+_wtest
+logs
+*.bak-v2
+README.md
+TASK.md

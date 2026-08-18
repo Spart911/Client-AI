@@ -1,9 +1,5 @@
 """
-Raspberry Pi voice client: wake word → record → backend → play.
-
-Supports two wake engines:
-- openWakeWord (OWW): pretrained/custom OWW heads (default)
-- microWakeWord (MWW): custom .json + .tflite from microwakeword-trainer
+Raspberry Pi voice client: microWakeWord «Джарвис» → record → backend → play.
 
 STT/LLM/TTS stay on the backend.
 """
@@ -17,6 +13,7 @@ import ctypes.util
 import io
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -43,15 +40,15 @@ logger = logging.getLogger("pi-client")
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
-# openWakeWord is most efficient on multiples of 80 ms (1280 samples @ 16 kHz).
-OWW_FRAME_SAMPLES = 1280
+# 80 ms blocks @ 16 kHz — matches microWakeWord streaming windows.
+FRAME_SAMPLES = 1280
 
 # Below this the barge-in gate sits at the speaker bleed level and lets it through.
 BARGE_MULT_MIN = 1.05
 # Soften the reply while we listen for an interrupt — leaves headroom for the
 # mic at any system volume (bleed scales with the speakers, the user's voice does not).
 BARGE_PLAYBACK_GAIN = 0.62
-# Keep feeding OWW this long after a burst dips under the gate.
+# Keep feeding the wake model this long after a burst dips under the gate.
 BARGE_HANGOVER_FRAMES = 4
 # Replay the frames just before the burst so the wake phrase keeps its onset.
 BARGE_ONSET_FRAMES = 2
@@ -74,13 +71,9 @@ MUSIC_GATE_MULT = 1.08
 # Sentinel: music ended mid-listen — reopen InputStream after HFP reseat.
 _REOPEN_MIC = object()
 
-DEFAULT_OWW_MODEL = "alexa"
-# HFP Bluetooth mics are quiet/noisy — 0.5 is too strict at room distance.
-DEFAULT_OWW_THRESHOLD = 0.35
-# tflite works on Pi 3B 32-bit; onnxruntime usually needs arm64/x86_64.
-DEFAULT_OWW_FRAMEWORK = "tflite"
-DEFAULT_WAKE_ENGINE = "oww"
-# High-pass for street/traffic rumble on HFP (Hz).
+DEFAULT_WAKE_THRESHOLD = 0.85
+DEFAULT_MWW_CONFIG = "/app/models/ru_jarvis_mww.json"
+# High-pass in front of RNNoise (Hz).
 DEFAULT_NOISE_HP_HZ = 280.0
 
 
@@ -109,53 +102,63 @@ def _load_librnnoise() -> ctypes.CDLL:
     )
 
 
-class MicDenoise:
-    """
-    Lightweight mic cleanup for Pi + HFP: high-pass + adaptive soft gate.
+class _Highpass:
+    """2nd-order Butterworth-ish high-pass (RBJ biquad). No scipy."""
 
-    Cuts low rumble (cars/windows) and attenuates steady background when it
-    sits near the noise floor. Cheap enough for every 80–100 ms frame.
-    Fallback when RNNoise/librnnoise is unavailable.
-    """
-
-    def __init__(self, rate: int = SAMPLE_RATE, hp_hz: float = DEFAULT_NOISE_HP_HZ) -> None:
-        from scipy.signal import butter, sosfilt_zi
-
-        self.rate = rate
-        self.hp_hz = float(np.clip(hp_hz, 80.0, 800.0))
-        self.label = f"highpass={self.hp_hz:.0f}Hz + soft gate"
-        self._sos = butter(2, self.hp_hz, btype="highpass", fs=rate, output="sos")
-        self._zi = sosfilt_zi(self._sos) * 0.0
-        self.noise_rms = 0.008
-        self._adapt = 0.04
+    def __init__(self, rate: int, hz: float) -> None:
+        w0 = 2.0 * math.pi * float(hz) / float(rate)
+        cos_w0 = math.cos(w0)
+        sin_w0 = math.sin(w0)
+        alpha = sin_w0 / (2.0 * math.sqrt(0.5))
+        b0 = (1.0 + cos_w0) * 0.5
+        b1 = -(1.0 + cos_w0)
+        b2 = (1.0 + cos_w0) * 0.5
+        a0 = 1.0 + alpha
+        a1 = -2.0 * cos_w0
+        a2 = 1.0 - alpha
+        self._b0 = b0 / a0
+        self._b1 = b1 / a0
+        self._b2 = b2 / a0
+        self._a1 = a1 / a0
+        self._a2 = a2 / a0
+        self.reset()
 
     def reset(self) -> None:
-        from scipy.signal import sosfilt_zi
+        self._z1 = 0.0
+        self._z2 = 0.0
 
-        self._zi = sosfilt_zi(self._sos) * 0.0
-        self.noise_rms = 0.008
+    def process(self, x: np.ndarray) -> np.ndarray:
+        y = np.empty(x.size, dtype=np.float32)
+        z1, z2 = self._z1, self._z2
+        b0, b1, b2 = self._b0, self._b1, self._b2
+        a1, a2 = self._a1, self._a2
+        for i, sample in enumerate(x):
+            w = float(sample) - a1 * z1 - a2 * z2
+            y[i] = b0 * w + b1 * z1 + b2 * z2
+            z2 = z1
+            z1 = w
+        self._z1, self._z2 = z1, z2
+        return y
 
-    def process(self, frame: np.ndarray) -> np.ndarray:
-        from scipy.signal import sosfilt
 
-        x = frame.astype(np.float32, copy=False)
-        if x.size == 0:
-            return x
-        y, self._zi = sosfilt(self._sos, x, zi=self._zi)
-        y = np.asarray(y, dtype=np.float32)
-        rms = float(np.sqrt(np.mean(np.square(y)))) if y.size else 0.0
-        # Adapt noise floor only on quiet-ish frames.
-        if rms < self.noise_rms * 2.2:
-            self.noise_rms = (
-                (1.0 - self._adapt) * self.noise_rms
-                + self._adapt * max(rms, 1e-5)
-            )
-        thr = max(self.noise_rms * 2.8, 1e-4)
-        if rms < thr:
-            # Soft quadratic gate — keeps speech onsets, ducks hiss/traffic bed.
-            gain = (rms / thr) ** 2
-            y = y * gain
-        return np.clip(y, -1.0, 1.0)
+def _resample_int(x: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    """Integer-ratio resample. 16 kHz ↔ 48 kHz is exactly ×3 / ÷3."""
+    x = np.asarray(x, dtype=np.float32)
+    if x.size == 0 or src_rate == dst_rate:
+        return x
+    g = math.gcd(int(src_rate), int(dst_rate))
+    up = int(dst_rate) // g
+    down = int(src_rate) // g
+    if down == 1:
+        n = int(x.size)
+        t_dst = np.linspace(0.0, n - 1, n * up, dtype=np.float64)
+        return np.interp(t_dst, np.arange(n, dtype=np.float64), x).astype(np.float32)
+    if up == 1:
+        n = int(x.size) - (int(x.size) % down)
+        if n <= 0:
+            return np.zeros(0, dtype=np.float32)
+        return x[:n].reshape(-1, down).mean(axis=1).astype(np.float32)
+    return _resample_int(_resample_int(x, src_rate, src_rate * up), src_rate * up, dst_rate)
 
 
 class RnnoiseDenoise:
@@ -170,13 +173,10 @@ class RnnoiseDenoise:
     MODEL_RATE = 48000
 
     def __init__(self, rate: int = SAMPLE_RATE, hp_hz: float = DEFAULT_NOISE_HP_HZ) -> None:
-        from scipy.signal import butter, sosfilt_zi
-
         self.rate = int(rate)
         self.hp_hz = float(np.clip(hp_hz, 80.0, 800.0))
         self.label = f"RNNoise + highpass={self.hp_hz:.0f}Hz"
-        self._sos = butter(2, self.hp_hz, btype="highpass", fs=self.rate, output="sos")
-        self._zi = sosfilt_zi(self._sos) * 0.0
+        self._hp = _Highpass(self.rate, self.hp_hz)
         self._buf48 = np.zeros(0, dtype=np.float32)
         self._pending16 = np.zeros(0, dtype=np.float32)
         self._lib = _load_librnnoise()
@@ -194,9 +194,7 @@ class RnnoiseDenoise:
             raise RuntimeError("rnnoise_create failed")
 
     def reset(self) -> None:
-        from scipy.signal import sosfilt_zi
-
-        self._zi = sosfilt_zi(self._sos) * 0.0
+        self._hp.reset()
         self._buf48 = np.zeros(0, dtype=np.float32)
         self._pending16 = np.zeros(0, dtype=np.float32)
         if self._st:
@@ -217,17 +215,11 @@ class RnnoiseDenoise:
             pass
 
     def process(self, frame: np.ndarray) -> np.ndarray:
-        from scipy.signal import resample_poly, sosfilt
-
         x = frame.astype(np.float32, copy=False)
         if x.size == 0:
             return x
-        y, self._zi = sosfilt(self._sos, x, zi=self._zi)
-        y = np.asarray(y, dtype=np.float32)
-        x48 = np.asarray(
-            resample_poly(y, self.MODEL_RATE, self.rate),
-            dtype=np.float32,
-        )
+        y = self._hp.process(x)
+        x48 = _resample_int(y, self.rate, self.MODEL_RATE)
         self._buf48 = np.concatenate([self._buf48, x48]) if self._buf48.size else x48
         out48: list[np.ndarray] = []
         while self._buf48.size >= self.FRAME:
@@ -242,10 +234,7 @@ class RnnoiseDenoise:
         if not out48:
             return np.clip(y, -1.0, 1.0)
         y48 = np.concatenate(out48)
-        y16 = np.asarray(
-            resample_poly(y48, self.rate, self.MODEL_RATE),
-            dtype=np.float32,
-        )
+        y16 = _resample_int(y48, self.MODEL_RATE, self.rate)
         if self._pending16.size:
             y16 = np.concatenate([self._pending16, y16])
         if y16.size >= x.size:
@@ -257,15 +246,8 @@ class RnnoiseDenoise:
         return np.clip(y16, -1.0, 1.0)
 
 
-def create_mic_denoise(rate: int, hp_hz: float):
-    """Prefer RNNoise; fall back to high-pass + gate."""
-    engine = (os.getenv("NOISE_ENGINE") or "rnnoise").strip().lower()
-    if engine in ("rnnoise", "rnn", "auto"):
-        try:
-            return RnnoiseDenoise(rate, hp_hz)
-        except Exception:
-            logger.warning("RNNoise unavailable — using high-pass + gate", exc_info=True)
-    return MicDenoise(rate, hp_hz)
+def create_mic_denoise(rate: int, hp_hz: float) -> RnnoiseDenoise:
+    return RnnoiseDenoise(rate, hp_hz)
 
 
 class VoiceClient:
@@ -278,13 +260,8 @@ class VoiceClient:
         silence_sec: float = 0.35,
         max_utterance_sec: float = 20.0,
         energy_threshold: float = 0.01,
-        wake_engine: str = DEFAULT_WAKE_ENGINE,
-        oww_model: str = DEFAULT_OWW_MODEL,
-        oww_threshold: float = DEFAULT_OWW_THRESHOLD,
-        oww_framework: str = DEFAULT_OWW_FRAMEWORK,
-        oww_vad_threshold: float = 0.0,
-        oww_model_path: str = "",
-        mww_model_config: str = "",
+        wake_threshold: float = DEFAULT_WAKE_THRESHOLD,
+        mww_model_config: str = DEFAULT_MWW_CONFIG,
         wake_cooldown_sec: float = 2.0,
         wake_stable_frames: int = 1,
         barge_in: bool = True,
@@ -304,36 +281,26 @@ class VoiceClient:
         self.mpv_command = (mpv_command or "").strip() or shutil.which("mpv") or "mpv"
         self.audio_device = audio_device
         self.noise_suppress = bool(noise_suppress)
-        self._denoise: MicDenoise | RnnoiseDenoise | None = None
+        self._denoise: RnnoiseDenoise | None = None
         if self.noise_suppress:
             try:
                 self._denoise = create_mic_denoise(SAMPLE_RATE, hp_hz=noise_hp_hz)
             except Exception:
                 logger.warning("Mic denoise unavailable — continuing without it", exc_info=True)
                 self.noise_suppress = False
-        self.wake_engine = (wake_engine or DEFAULT_WAKE_ENGINE).strip().lower()
-        if self.wake_engine not in ("oww", "mww"):
-            self.wake_engine = DEFAULT_WAKE_ENGINE
-        # Display / logging only — detection is the OWW model (default alexa).
-        label = (oww_model or DEFAULT_OWW_MODEL).strip() or DEFAULT_OWW_MODEL
+        label = "Джарвис"
         if wake_words:
             normalized = [self._normalize(w) for w in wake_words if w.strip()]
             self.wake_words = list(dict.fromkeys(normalized)) or [label]
         else:
             self.wake_words = [label]
-        self.oww_model = label
-        self.oww_threshold = float(np.clip(oww_threshold, 0.05, 0.99))
-        self.oww_framework = (oww_framework or DEFAULT_OWW_FRAMEWORK).strip().lower()
-        if self.oww_framework not in ("onnx", "tflite"):
-            self.oww_framework = DEFAULT_OWW_FRAMEWORK
-        self.oww_vad_threshold = max(0.0, float(oww_vad_threshold))
-        self.oww_model_path = (oww_model_path or "").strip()
-        self.mww_model_config = (mww_model_config or "").strip()
+        self.wake_threshold = float(np.clip(wake_threshold, 0.05, 0.99))
+        self.mww_model_config = (mww_model_config or DEFAULT_MWW_CONFIG).strip()
         self.silence_sec = silence_sec
         self.max_utterance_sec = max_utterance_sec
         self.energy_threshold = energy_threshold
         self.wake_cooldown_sec = wake_cooldown_sec
-        # Consecutive OWW frames (80 ms) above threshold before accept.
+        # Consecutive 80 ms frames above threshold before accept.
         self.wake_stable_frames = max(1, wake_stable_frames)
         self.barge_in = barge_in
         # Headroom over the loudest bleed frame of our own reply. Keep it small:
@@ -345,8 +312,6 @@ class VoiceClient:
                 barge_energy_mult,
                 BARGE_MULT_MIN,
             )
-        self._oww = None
-        self._oww_labels: list[str] = []
         self._mww = None
         self._mww_features = None
         self._mww_wake_word = ""
@@ -369,12 +334,7 @@ class VoiceClient:
     def run(self) -> None:
         logger.info("Backend: %s", self.backend_url)
         logger.info("Device id: %s", self.device_id)
-        logger.info(
-            "Wake engine=%s model=%s threshold=%.2f",
-            self.wake_engine,
-            self.oww_model,
-            self.oww_threshold,
-        )
+        logger.info("Wake threshold=%.2f config=%s", self.wake_threshold, self.mww_model_config)
         if self._denoise is not None:
             logger.info("Mic denoise: %s", self._denoise.label)
         else:
@@ -388,11 +348,7 @@ class VoiceClient:
         self._sync_volume_from_backend()
         if self.music_poll:
             self._start_music_poller()
-        wake_label = (
-            self._mww_wake_word
-            or (self.wake_words[0] if self.wake_words else self.oww_model)
-            or "wake"
-        )
+        wake_label = self._mww_wake_word or (self.wake_words[0] if self.wake_words else "Джарвис")
         logger.info(
             "Wake mode: %s — say «%s …» then your command.",
             self._wake_mode,
@@ -586,10 +542,7 @@ class VoiceClient:
             sys.exit(1)
 
     def _init_wake(self) -> None:
-        if self.wake_engine == "mww":
-            self._init_mww()
-        else:
-            self._init_oww()
+        self._init_mww()
 
     def _init_mww(self) -> None:
         try:
@@ -618,7 +571,7 @@ class VoiceClient:
             self._mww_wake_word = getattr(self._mww, "wake_word", "mww")
             # Trainer default is cutoff 0.9 over 10 frames — too strict for a
             # room USB mic. Override both from env.
-            self._mww.probability_cutoff = self.oww_threshold
+            self._mww.probability_cutoff = self.wake_threshold
             window = max(1, int(os.getenv("MWW_WINDOW", "10")))
             self._mww.sliding_window_size = window
             self._mww._probabilities = deque(maxlen=window)
@@ -634,87 +587,18 @@ class VoiceClient:
             logger.error("microWakeWord init failed: %s", exc)
             sys.exit(1)
 
-    def _init_oww(self) -> None:
-        try:
-            import openwakeword
-            from openwakeword.model import Model
-        except Exception as exc:
-            logger.error(
-                "openWakeWord import failed (%s). Install: pip install openwakeword onnxruntime",
-                exc,
-            )
-            sys.exit(1)
-
-        try:
-            # Mel + embedding (+ optional VAD) live next to the wake head.
-            openwakeword.utils.download_models()
-            wake_ref = self.oww_model_path or self.oww_model
-            frameworks = [self.oww_framework]
-            if self.oww_framework == "onnx":
-                frameworks.append("tflite")
-            elif self.oww_framework == "tflite":
-                frameworks.append("onnx")
-            last_error: Exception | None = None
-            for framework in frameworks:
-                try:
-                    try:
-                        self._oww = Model(
-                            wakeword_models=[wake_ref],
-                            inference_framework=framework,
-                            vad_threshold=self.oww_vad_threshold,
-                            enable_speex_noise_suppression=True,
-                        )
-                    except Exception as speex_exc:
-                        logger.warning(
-                            "OWW speex NS unavailable (%s) — retry without it",
-                            speex_exc,
-                        )
-                        self._oww = Model(
-                            wakeword_models=[wake_ref],
-                            inference_framework=framework,
-                            vad_threshold=self.oww_vad_threshold,
-                        )
-                    self.oww_framework = framework
-                    break
-                except Exception as exc:
-                    last_error = exc
-                    logger.warning("openWakeWord %s init failed: %s", framework, exc)
-                    self._oww = None
-            if self._oww is None:
-                raise RuntimeError(last_error or "no inference framework worked")
-            self._oww_labels = list(self._oww.models.keys())
-            if not self._oww_labels:
-                raise RuntimeError("openWakeWord loaded zero models")
-            self._wake_mode = "oww"
-            logger.info(
-                "openWakeWord ready: models=%s framework=%s threshold=%.2f vad=%.2f",
-                self._oww_labels,
-                self.oww_framework,
-                self.oww_threshold,
-                self.oww_vad_threshold,
-            )
-        except Exception as exc:
-            logger.error("openWakeWord init failed: %s", exc)
-            sys.exit(1)
-
     def _wait_for_wake(self) -> np.ndarray | None:
-        if self._wake_mode not in ("mww", "oww"):
+        if self._wake_mode != "mww":
             raise RuntimeError("Wake engine is not initialized")
         self._in_wake_listen = True
         try:
             # echo_gate starts False; sync_music_duck toggles it when mpv starts.
             # Reopen the mic stream after music ends so HFP SCO is not stale.
             while True:
-                if self._wake_mode == "mww":
-                    result = self._wait_mww(
-                        echo_gate=False,
-                        music_duck=True,
-                    )
-                else:
-                    result = self._wait_oww(
-                        echo_gate=False,
-                        music_duck=True,
-                    )
+                result = self._wait_mww(
+                    echo_gate=False,
+                    music_duck=True,
+                )
                 if result is _REOPEN_MIC:
                     logger.info("Reopening mic after music (HFP reseat)")
                     continue
@@ -743,7 +627,7 @@ class VoiceClient:
         )
         score_limit = float(self._mww.probability_cutoff)
 
-        block = OWW_FRAME_SAMPLES
+        block = FRAME_SAMPLES
         q: queue.Queue[np.ndarray] = queue.Queue()
         stable = 0
         use_gate = bool(echo_gate)
@@ -981,292 +865,6 @@ class VoiceClient:
                             " (music)" if music_mode else (
                                 " (barge)" if barge_soft else ""
                             ),
-                        )
-                        return self._preroll_array(preroll)
-        finally:
-            if music_duck and music_mode:
-                self._restore_music_volume()
-
-    def _wait_oww(
-        self,
-        *,
-        deadline: float | None = None,
-        energy_threshold: float | None = None,
-        respect_cooldown: bool = True,
-        echo_gate: bool = False,
-        stable_frames: int | None = None,
-        music_duck: bool = False,
-    ) -> np.ndarray | None:
-        """
-        Stream the mic until openWakeWord fires; return recent preroll audio.
-
-        With a deadline (barge-in during playback) it returns None on timeout.
-        echo_gate keeps TTS/music out of the model: inference starts on a burst
-        louder than speaker bleed and continues until the burst ends.
-        """
-        from collections import deque
-
-        assert self._oww is not None
-        threshold = (
-            self.energy_threshold if energy_threshold is None else energy_threshold
-        )
-        stable_needed = (
-            self.wake_stable_frames if stable_frames is None else max(1, stable_frames)
-        )
-        score_limit = self.oww_threshold
-
-        block = OWW_FRAME_SAMPLES
-        q: queue.Queue[np.ndarray] = queue.Queue()
-        stable = 0
-        use_gate = bool(echo_gate)
-        music_mode = False
-        speech_ducked = False
-        reopen_after_music = False
-        # ~1.5 s of float audio after wake for a trailing command fragment.
-        # Idle: keep ~2.8s so «Джарвис какая погода» keeps the command tail.
-        preroll: deque[np.ndarray] = deque(maxlen=4 if use_gate else 35)
-        floor_window: deque[float] = deque(maxlen=16)
-        pre_burst_f: deque[np.ndarray] = deque(maxlen=BARGE_ONSET_FRAMES)
-        feeding = False
-        quiet_frames = 0
-        gate_logged = False
-        last_score_log = 0.0
-        last_heartbeat = 0.0
-        frames_seen = 0
-        peak_energy = 0.0
-        peak_score = 0.0
-
-        def callback(indata, frames, time_info, status) -> None:  # noqa: ARG001
-            if status:
-                logger.warning("mic status: %s", status)
-            q.put(indata.copy())
-
-        def sync_music_duck() -> None:
-            nonlocal use_gate, music_mode, speech_ducked, preroll
-            nonlocal stable, feeding, quiet_frames, reopen_after_music
-            if not music_duck:
-                return
-            playing = self._is_music_playing()
-            if playing and not music_mode:
-                music_mode = True
-                use_gate = True
-                preroll = deque(preroll, maxlen=4)
-                floor_window.clear()
-                pre_burst_f.clear()
-                feeding = False
-                quiet_frames = 0
-                speech_ducked = False
-                stable = 0
-                self._oww.reset()
-                self._duck_music(MUSIC_LISTEN_DUCK)
-                logger.info(
-                    "Music on — duck×%.2f + soft wake scoring over bleed",
-                    MUSIC_LISTEN_DUCK,
-                )
-            elif not playing and music_mode:
-                music_mode = False
-                speech_ducked = False
-                use_gate = False
-                preroll = deque(preroll, maxlen=35)
-                floor_window.clear()
-                pre_burst_f.clear()
-                feeding = False
-                quiet_frames = 0
-                stable = 0
-                self._oww.reset()
-                self._restore_hfp_audio()
-                reopen_after_music = True
-                logger.info("Music off — cleared wake gate, restored HFP")
-
-        def set_feeding(active: bool) -> None:
-            nonlocal feeding, quiet_frames, speech_ducked, stable
-            if active == feeding:
-                return
-            feeding = active
-            quiet_frames = 0
-            if active:
-                self._oww.reset()
-                stable = 0
-            if not music_mode:
-                return
-            if active:
-                self._duck_music(MUSIC_SPEECH_DUCK)
-                speech_ducked = True
-            elif speech_ducked:
-                self._duck_music(MUSIC_LISTEN_DUCK)
-                speech_ducked = False
-
-        if deadline is None:
-            logger.info(
-                "Listening for openWakeWord %s (score≥%.2f, stable≥%d×80ms, energy≥%.3f)",
-                self._oww_labels,
-                score_limit,
-                stable_needed,
-                threshold,
-            )
-        else:
-            logger.info(
-                "Barge-in armed: say «%s …» to interrupt (score≥%.2f, energy≥%.3f)",
-                self.wake_words[0] if self.wake_words else "alexa",
-                score_limit,
-                threshold,
-            )
-
-        try:
-            self._oww.reset()
-            if self._denoise is not None:
-                self._denoise.reset()
-            sync_music_duck()
-            with sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype="int16",
-                blocksize=block,
-                callback=callback,
-            ):
-                while True:
-                    if deadline is not None and time.monotonic() >= deadline:
-                        return None
-                    sync_music_duck()
-                    if reopen_after_music:
-                        return _REOPEN_MIC
-                    try:
-                        chunk = q.get(timeout=0.25)
-                    except queue.Empty:
-                        continue
-                    mono = chunk.reshape(-1)
-                    if mono.size != block:
-                        # PortAudio sometimes delivers short frames — pad/trim.
-                        if mono.size < block:
-                            mono = np.pad(mono, (0, block - mono.size))
-                        else:
-                            mono = mono[:block]
-                    frame_f = mono.astype(np.float32) / 32768.0
-                    if self._denoise is not None:
-                        frame_f = self._denoise.process(frame_f)
-                        mono = np.clip(frame_f * 32768.0, -32768, 32767).astype(np.int16)
-                    frame_energy = self._rms(frame_f)
-                    frames_seen += 1
-                    if frame_energy > peak_energy:
-                        peak_energy = frame_energy
-                    if frames_seen == 1:
-                        logger.info(
-                            "Mic first frame: samples=%d rms=%.5f peak=%.5f",
-                            mono.size,
-                            frame_energy,
-                            float(np.max(np.abs(frame_f))),
-                        )
-
-                    if use_gate:
-                        gate_mult = (
-                            MUSIC_GATE_MULT if music_mode else self.barge_energy_mult
-                        )
-                        gate = self._echo_gate(
-                            floor_window, threshold, mult=gate_mult
-                        )
-                        loud = gate is not None and frame_energy >= gate
-                        if not loud and not feeding:
-                            floor_window.append(frame_energy)
-                        if loud:
-                            quiet_frames = 0
-                            if not feeding:
-                                set_feeding(True)
-                                for onset in pre_burst_f:
-                                    preroll.append(onset)
-                                pre_burst_f.clear()
-                                if not gate_logged:
-                                    logger.info(
-                                        "Speech gate %.3f — heard %.3f over playback",
-                                        gate,
-                                        frame_energy,
-                                    )
-                                    gate_logged = True
-                        elif feeding:
-                            quiet_frames += 1
-                            if quiet_frames > BARGE_HANGOVER_FRAMES:
-                                set_feeding(False)
-                                stable = 0
-                        if not feeding:
-                            pre_burst_f.append(frame_f.copy())
-                            # During music still score wake under the bleed gate.
-                            if not music_mode:
-                                continue
-                        preroll.append(frame_f.copy())
-                    else:
-                        preroll.append(frame_f.copy())
-
-                    now = time.monotonic()
-                    if (
-                        respect_cooldown
-                        and now - self._last_wake_ts < self.wake_cooldown_sec
-                    ):
-                        # Keep the model warm but ignore hits during cooldown.
-                        self._oww.predict(mono)
-                        stable = 0
-                        continue
-
-                    prediction = self._oww.predict(mono)
-                    best_name = ""
-                    best_score = 0.0
-                    # Prefer configured labels, but also scan every key OWW returns
-                    # (some builds name heads alexa_v0.1 instead of alexa).
-                    for name, raw in prediction.items():
-                        try:
-                            score = float(np.asarray(raw).reshape(-1)[0])
-                        except Exception:
-                            continue
-                        if score > best_score:
-                            best_score = score
-                            best_name = str(name)
-                    if best_score > peak_score:
-                        peak_score = best_score
-
-                    now = time.monotonic()
-                    if now - last_heartbeat >= 5.0:
-                        logger.info(
-                            "Mic heartbeat: rms=%.5f peak_rms=%.5f oww=%s=%.3f peak_score=%.3f frames=%d%s",
-                            frame_energy,
-                            peak_energy,
-                            best_name or (self._oww_labels[0] if self._oww_labels else "?"),
-                            best_score,
-                            peak_score,
-                            frames_seen,
-                            " [music]" if music_mode else "",
-                        )
-                        last_heartbeat = now
-                        peak_energy = 0.0
-
-                    if best_score >= max(0.12, score_limit * 0.35) and (
-                        abs(best_score - last_score_log) >= 0.05
-                    ):
-                        logger.info(
-                            "OWW score %s=%.3f energy=%.4f%s",
-                            best_name,
-                            best_score,
-                            frame_energy,
-                            " [music]" if music_mode else "",
-                        )
-                        last_score_log = best_score
-
-                    # HFP Bluetooth mics are quiet — if OWW is confident, accept
-                    # even when RMS looks near silence.
-                    energy_ok = (
-                        frame_energy >= min(threshold * 0.35, 0.001)
-                        or best_score >= score_limit
-                        or music_mode
-                    )
-                    if best_score >= score_limit and energy_ok:
-                        stable += 1
-                    else:
-                        stable = 0
-
-                    if stable >= stable_needed:
-                        logger.info(
-                            "Wake matched (oww): %s score=%.3f energy=%.3f%s",
-                            best_name or self.oww_model,
-                            best_score,
-                            frame_energy,
-                            " (music)" if music_mode else "",
                         )
                         return self._preroll_array(preroll)
         finally:
@@ -2286,28 +1884,16 @@ class VoiceClient:
         # often blocks real «Джарвис». Soften gate on Bluetooth.
         if on_bt:
             threshold = max(0.0008, threshold * 0.55)
-        # Energy gate + OWW/MWW score replace Vosk echo-text filtering.
+        # Energy gate + MWW score replace Vosk echo-text filtering.
         _ = reply_text
-        if self._wake_mode == "mww":
-            return self._wait_mww(
-                deadline=deadline,
-                energy_threshold=threshold,
-                respect_cooldown=False,
-                echo_gate=True,
-                stable_frames=1,
-                barge_soft=on_bt,
-            )
-        if self._wake_mode == "oww":
-            return self._wait_oww(
-                deadline=deadline,
-                energy_threshold=threshold,
-                respect_cooldown=False,
-                echo_gate=True,
-                # Over the reply the phrase arrives once — waiting for many
-                # matching frames usually means missing it.
-                stable_frames=1,
-            )
-        return None
+        return self._wait_mww(
+            deadline=deadline,
+            energy_threshold=threshold,
+            respect_cooldown=False,
+            echo_gate=True,
+            stable_frames=1,
+            barge_soft=on_bt,
+        )
 
     def _trim_utterance(self, frames: np.ndarray) -> np.ndarray:
         """Drop leading/trailing hush so upload + STT see less silence."""
@@ -2364,56 +1950,45 @@ class VoiceClient:
         value = value.replace("асистент", "ассистент")
         return value
 
+    def close(self) -> None:
+        """Stop background polling and release the shared HTTP client."""
+        self._music_stop.set()
+        try:
+            self._http.close()
+        except Exception:
+            pass
+
+
+def _env_wake_threshold() -> float:
+    raw = os.getenv("WAKE_THRESHOLD") or os.getenv("OWW_THRESHOLD")
+    if raw:
+        return float(raw)
+    return DEFAULT_WAKE_THRESHOLD
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Raspberry Pi voice client for Open WebUI (OWW/MWW + mpv)",
+        description="Raspberry Pi voice client: microWakeWord Jarvis + backend TTS",
     )
     parser.add_argument(
         "--backend",
         default=os.getenv("VOICE_BACKEND_URL", "http://voice.pora-ai.ru"),
     )
     parser.add_argument(
-        "--wake-engine",
-        default=os.getenv("WAKE_ENGINE", DEFAULT_WAKE_ENGINE),
-        help="Wake engine: oww (openWakeWord) or mww (microWakeWord)",
-    )
-    parser.add_argument(
-        "--oww-model",
-        default=os.getenv("OWW_MODEL", DEFAULT_OWW_MODEL),
-        help="openWakeWord pretrained name (default: alexa)",
-    )
-    parser.add_argument(
-        "--oww-threshold",
+        "--wake-threshold",
         type=float,
-        default=float(os.getenv("OWW_THRESHOLD", str(DEFAULT_OWW_THRESHOLD))),
-        help="Wake score threshold 0–1 (default 0.35)",
-    )
-    parser.add_argument(
-        "--oww-framework",
-        default=os.getenv("OWW_FRAMEWORK", DEFAULT_OWW_FRAMEWORK),
-        help="Inference backend: onnx or tflite (default tflite)",
-    )
-    parser.add_argument(
-        "--oww-vad",
-        type=float,
-        default=float(os.getenv("OWW_VAD_THRESHOLD", "0")),
-        help="Silero VAD gate for OWW (0=off, try 0.5 to cut false accepts)",
-    )
-    parser.add_argument(
-        "--oww-model-path",
-        default=os.getenv("OWW_MODEL_PATH", ""),
-        help="Optional path to a custom .onnx/.tflite wake model",
+        default=_env_wake_threshold(),
+        help="Wake score threshold 0–1 (default 0.85; also reads OWW_THRESHOLD)",
     )
     parser.add_argument(
         "--mww-model-config",
-        default=os.getenv("MWW_MODEL_CONFIG", ""),
-        help="Path to *_mww.json from microwakeword-trainer",
+        default=os.getenv("MWW_MODEL_CONFIG", DEFAULT_MWW_CONFIG),
+        help="Path to ru_jarvis_mww.json",
     )
     parser.add_argument(
         "--wake",
         default=os.getenv("WAKE_WORDS", ""),
-        help="Optional display label (detection uses OWW_MODEL)",
+        help="Optional display label (detection uses the MWW model)",
     )
     parser.add_argument(
         "--silence",
@@ -2432,7 +2007,7 @@ def main() -> None:
         "--wake-stable",
         type=int,
         default=int(os.getenv("WAKE_STABLE_FRAMES", "1")),
-        help="OWW: consecutive 80ms frames above threshold before accept",
+        help="Consecutive 80ms frames above threshold before accept",
     )
     parser.add_argument(
         "--wake-cooldown",
@@ -2486,7 +2061,7 @@ def main() -> None:
         dest="noise_suppress",
         action="store_true",
         default=os.getenv("NOISE_SUPPRESS", "true").lower() in ("1", "true", "yes"),
-        help="Mic denoise: RNNoise if available, else high-pass + gate (default on)",
+        help="Mic denoise via RNNoise (default on)",
     )
     parser.add_argument(
         "--no-noise-suppress",
@@ -2510,12 +2085,7 @@ def main() -> None:
         silence_sec=args.silence,
         max_utterance_sec=args.max_sec,
         energy_threshold=args.energy,
-        wake_engine=args.wake_engine,
-        oww_model=args.oww_model,
-        oww_threshold=args.oww_threshold,
-        oww_framework=args.oww_framework,
-        oww_vad_threshold=args.oww_vad,
-        oww_model_path=args.oww_model_path,
+        wake_threshold=args.wake_threshold,
         mww_model_config=args.mww_model_config,
         wake_cooldown_sec=args.wake_cooldown,
         wake_stable_frames=args.wake_stable,
@@ -2533,6 +2103,8 @@ def main() -> None:
         client.run()
     except KeyboardInterrupt:
         logger.info("Stopped")
+    finally:
+        client.close()
 
 
 if __name__ == "__main__":
