@@ -24,9 +24,11 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import wave
 from collections import deque
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 import numpy as np
@@ -318,6 +320,9 @@ class VoiceClient:
         self._music_lock = threading.Lock()
         self._cue_lock = threading.Lock()
         self._music_stop = threading.Event()
+        self._alert_stop = threading.Event()
+        self._alert_cv = threading.Condition()
+        self._alerts: list[dict] = []
         self._current_track_id = ""
         self._current_source = ""
         self._volume_level = 7  # 1..10
@@ -346,6 +351,7 @@ class VoiceClient:
         self._sync_volume_from_backend()
         if self.music_poll:
             self._start_music_poller()
+        self._start_alert_scheduler()
         wake_label = self._mww_wake_word or (self.wake_words[0] if self.wake_words else "Джарвис")
         logger.info(
             "Wake mode: %s — say «%s …» then your command.",
@@ -1343,8 +1349,13 @@ class VoiceClient:
 
     def _handle_playback(self, command: dict) -> None:
         action = str(command.get("action") or "").strip().lower()
+        stream_url = str(command.get("url") or "").strip()
+        if action in ("timer", "alarm", "cancel_alert", "cancel_timer", "cancel_alarm") or stream_url.startswith(
+            "pi-alert://"
+        ):
+            self._handle_alert_command(command)
+            return
         if action == "play":
-            stream_url = str(command.get("url") or "").strip()
             title = str(command.get("title") or "").strip()
             artist = str(command.get("artist") or "").strip()
             track_id = str(command.get("track_id") or "").strip()
@@ -1449,12 +1460,184 @@ class VoiceClient:
         except Exception as exc:
             logger.debug("pactl volume failed: %s", exc)
 
+    def _start_alert_scheduler(self) -> None:
+        thread = threading.Thread(
+            target=self._alert_scheduler_loop,
+            name="alert-scheduler",
+            daemon=True,
+        )
+        thread.start()
+        logger.info("Alert scheduler enabled (timer/alarm)")
+
+    def _handle_alert_command(self, command: dict) -> None:
+        parsed = dict(command)
+        url = str(parsed.get("url") or "").strip()
+        if url.startswith("pi-alert://"):
+            parsed.update(self._parse_alert_url(url))
+        kind = str(parsed.get("kind") or parsed.get("action") or "").strip().lower()
+        if kind in ("cancel", "cancel_alert", "cancel_timer", "cancel_alarm"):
+            target = str(parsed.get("cancel_kind") or parsed.get("target") or "").strip().lower()
+            if kind == "cancel_timer":
+                target = "timer"
+            elif kind == "cancel_alarm":
+                target = "alarm"
+            self._cancel_alerts(kind=target or None)
+            return
+        fire_at = parsed.get("fire_at")
+        delay_sec = parsed.get("delay_sec")
+        try:
+            if fire_at is not None and str(fire_at).strip() != "":
+                when = float(fire_at)
+            elif delay_sec is not None and str(delay_sec).strip() != "":
+                when = time.time() + max(0.0, float(delay_sec))
+            else:
+                when = time.time()
+        except (TypeError, ValueError):
+            logger.error("Alert command missing fire_at/delay_sec: %s", parsed)
+            return
+        job = {
+            "id": str(parsed.get("id") or uuid.uuid4())[:12],
+            "kind": "alarm" if kind == "alarm" else "timer",
+            "fire_at": when,
+            "sound": str(parsed.get("sound") or "classic").strip() or "classic",
+            "media_url": str(parsed.get("media_url") or parsed.get("sound_url") or "").strip(),
+            "label": str(parsed.get("title") or parsed.get("label") or "").strip(),
+            "loop": str(parsed.get("loop") or ("1" if kind == "alarm" else "0")).strip()
+            not in ("0", "false", "no"),
+        }
+        wait = max(0.0, when - time.time())
+        logger.info(
+            "Scheduled %s in %.0fs sound=%s loop=%s",
+            job["kind"],
+            wait,
+            job["sound"],
+            job["loop"],
+        )
+        with self._alert_cv:
+            self._alerts.append(job)
+            self._alert_cv.notify_all()
+
+    @staticmethod
+    def _parse_alert_url(url: str) -> dict:
+        parsed = urlparse(url)
+        kind = (parsed.netloc or parsed.path.lstrip("/")).strip().lower()
+        q = {k: unquote(v[-1]) for k, v in parse_qs(parsed.query).items() if v}
+        out = {"kind": kind, **q}
+        if "url" in q and "media_url" not in out:
+            out["media_url"] = q["url"]
+        return out
+
+    def _cancel_alerts(self, *, kind: str | None = None) -> None:
+        with self._alert_cv:
+            before = len(self._alerts)
+            if kind:
+                self._alerts = [j for j in self._alerts if j.get("kind") != kind]
+            else:
+                self._alerts.clear()
+            removed = before - len(self._alerts)
+            self._alert_cv.notify_all()
+        if kind in (None, "alarm", "timer"):
+            with self._music_lock:
+                if self._current_source == "alert":
+                    self._terminate_music_proc()
+                    self._current_source = ""
+        logger.info("Cancelled alerts kind=%s removed=%d", kind or "all", removed)
+
+    def _alert_scheduler_loop(self) -> None:
+        while not self._alert_stop.is_set():
+            with self._alert_cv:
+                if not self._alerts:
+                    self._alert_cv.wait(timeout=1.0)
+                    continue
+                self._alerts.sort(key=lambda job: float(job.get("fire_at") or 0.0))
+                nxt = self._alerts[0]
+                delay = float(nxt["fire_at"]) - time.time()
+                if delay > 0:
+                    self._alert_cv.wait(timeout=min(delay, 1.0))
+                    continue
+                self._alerts.pop(0)
+            try:
+                self._fire_alert(nxt)
+            except Exception:
+                logger.exception("Alert playback failed")
+
+    def _fire_alert(self, job: dict) -> None:
+        label = job.get("label") or job.get("kind")
+        logger.info("Firing %s (%s)", job.get("kind"), label)
+        media = str(job.get("media_url") or "").strip()
+        tmp: Path | None = None
+        if not media:
+            tmp = self._write_builtin_alert(
+                str(job.get("kind") or "timer"),
+                str(job.get("sound") or "classic"),
+            )
+            media = str(tmp)
+        loop_file = "inf" if job.get("loop") else "4"
+        self._start_music(media, source="alert", loop_file=loop_file)
+
+    def _write_builtin_alert(self, kind: str, sound: str) -> Path:
+        rate = 16000
+        if kind == "timer":
+            audio = self._synth_timer_tone(rate)
+        elif sound == "digital":
+            audio = self._synth_alarm_digital(rate)
+        elif sound == "soft":
+            audio = self._synth_alarm_soft(rate)
+        else:
+            audio = self._synth_alarm_classic(rate)
+        fd, name = tempfile.mkstemp(prefix=f"{kind}-", suffix=".wav")
+        os.close(fd)
+        path = Path(name)
+        self._write_wav_pcm(path, audio, rate)
+        return path
+
+    @classmethod
+    def _synth_timer_tone(cls, rate: int) -> np.ndarray:
+        gap = np.zeros(int(rate * 0.12), dtype=np.float32)
+        burst = np.concatenate(
+            [
+                cls._tone(rate, 880.0, 0.12, amplitude=0.28),
+                gap,
+                cls._tone(rate, 1320.0, 0.18, amplitude=0.30),
+                np.zeros(int(rate * 0.35), dtype=np.float32),
+            ]
+        )
+        return np.tile(burst, 2)
+
+    @classmethod
+    def _synth_alarm_classic(cls, rate: int) -> np.ndarray:
+        hi = cls._tone(rate, 880.0, 0.35, amplitude=0.32, harm=0.08)
+        lo = cls._tone(rate, 698.5, 0.35, amplitude=0.32, harm=0.08)
+        pause = np.zeros(int(rate * 0.12), dtype=np.float32)
+        return np.concatenate([hi, pause, lo, pause, hi, pause, lo, np.zeros(int(rate * 0.25), dtype=np.float32)])
+
+    @classmethod
+    def _synth_alarm_digital(cls, rate: int) -> np.ndarray:
+        pieces: list[np.ndarray] = []
+        for freq in (1200.0, 1500.0, 1200.0, 1500.0):
+            pieces.append(cls._tone(rate, freq, 0.08, amplitude=0.28, attack=0.005, release=0.02, harm=0.02))
+            pieces.append(np.zeros(int(rate * 0.06), dtype=np.float32))
+        pieces.append(np.zeros(int(rate * 0.2), dtype=np.float32))
+        return np.concatenate(pieces)
+
+    @classmethod
+    def _synth_alarm_soft(cls, rate: int) -> np.ndarray:
+        return np.concatenate(
+            [
+                cls._tone(rate, 523.25, 0.22, amplitude=0.22),
+                np.zeros(int(rate * 0.08), dtype=np.float32),
+                cls._tone(rate, 659.25, 0.28, amplitude=0.24),
+                np.zeros(int(rate * 0.35), dtype=np.float32),
+            ]
+        )
+
     def _start_music(
         self,
         stream_url: str,
         *,
         track_id: str = "",
         source: str = "",
+        loop_file: str = "no",
     ) -> None:
         with self._music_lock:
             self._terminate_music_proc()
@@ -1470,7 +1653,9 @@ class VoiceClient:
                 # Start already ducked if we are in wake-listen — full blast would
                 # bury the mic until the next gate sync tick.
                 start_vol = percent
-                if self._in_wake_listen:
+                if source == "alert":
+                    start_vol = max(percent, 70)
+                elif self._in_wake_listen:
                     start_vol = max(5, int(round(percent * MUSIC_LISTEN_DUCK)))
                 self._music_proc = subprocess.Popen(
                     [
@@ -1478,6 +1663,7 @@ class VoiceClient:
                         "--no-video",
                         "--really-quiet",
                         f"--volume={start_vol}",
+                        f"--loop-file={loop_file}",
                         f"--input-ipc-server={ipc}",
                         stream_url,
                     ],
@@ -1514,6 +1700,8 @@ class VoiceClient:
             self._current_track_id = ""
             self._current_source = ""
         if code != 0:
+            return
+        if source == "alert":
             return
         # Natural end — ask server for next Моя волна track if active.
         if source == "yandex-wave" or track_id:
@@ -1928,6 +2116,9 @@ class VoiceClient:
 
     def close(self) -> None:
         """Stop background polling and release the shared HTTP client."""
+        self._alert_stop.set()
+        with self._alert_cv:
+            self._alert_cv.notify_all()
         self._music_stop.set()
         try:
             self._http.close()
