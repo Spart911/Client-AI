@@ -79,10 +79,13 @@ _REOPEN_MIC = object()
 
 DEFAULT_WAKE_THRESHOLD = 0.90
 DEFAULT_MWW_CONFIG = "/app/models/ru_jarvis_mww.json"
-# Real «Джарвис» on the USB mic is ~0.02–0.03 RMS. False accepts sat at ~0.004.
-DEFAULT_WAKE_ACCEPT_ENERGY = 0.012
+# Room «Джарвис» on the USB mic is ~0.006–0.013 RMS. Close-mic was ~0.02.
+# Flat false accepts sat at ~0.0036. Score peaks after the word (MWW window).
+DEFAULT_WAKE_ACCEPT_ENERGY = 0.006
 # Peak in the recent window must also outrun the quiet floor.
 WAKE_ENERGY_BURST_RATIO = 2.5
+# Use energy from this many trailing 80 ms frames when the score catches up.
+WAKE_ENERGY_LOOKBACK = 12
 # Idle listen: at least this many 80 ms frames above score+energy.
 WAKE_STABLE_MIN = 3
 # High-pass in front of RNNoise (Hz).
@@ -665,10 +668,11 @@ class VoiceClient:
         gate_logged = False
         last_heartbeat = 0.0
         last_score_log = 0.0
+        last_hold_log = 0.0
         peak_energy = 0.0
         peak_score = 0.0
         frames_seen = 0
-        recent_energy: deque[float] = deque(maxlen=16)
+        recent_energy: deque[float] = deque(maxlen=24)
 
         def callback(indata, frames, time_info, status) -> None:  # noqa: ARG001
             if status:
@@ -877,14 +881,35 @@ class VoiceClient:
                     peak_score = max(peak_score, best_score)
 
                     now = time.monotonic()
+                    accept_energy = self.wake_accept_energy
+                    if barge_soft or (music_mode and not open_echo):
+                        accept_energy = max(0.004, accept_energy * 0.5)
+                    burst_ok, burst_peak, burst_floor = self._wake_burst_ok(
+                        recent_energy, accept_energy
+                    )
+                    if (
+                        use_gate
+                        and not barge_soft
+                        and floor_window
+                        and burst_ok
+                    ):
+                        play_floor = sorted(floor_window)[len(floor_window) // 2]
+                        if play_floor > 1e-6 and burst_peak < play_floor * BARGE_TTS_GATE_MULT:
+                            burst_ok = False
+                            burst_floor = play_floor
+                    armed = arm_sec <= 0.0 or (now - listen_started) >= arm_sec
+                    score_ok = best_score >= score_limit and burst_ok and armed
+
                     if best_score >= 0.08 and (
                         abs(best_score - last_score_log) >= 0.04
                     ):
                         logger.info(
-                            "MWW score %.3f energy=%.4f (need ≥%.2f)%s",
+                            "MWW score %.3f energy=%.4f "
+                            "(need score≥%.2f energy≥%.3f)%s",
                             best_score,
-                            max(recent_energy) if recent_energy else frame_energy,
+                            burst_peak,
                             score_limit,
+                            accept_energy,
                             " [music]" if music_mode else (
                                 " [barge-soft]" if barge_soft else ""
                             ),
@@ -905,26 +930,8 @@ class VoiceClient:
                         peak_energy = 0.0
                         peak_score = 0.0
 
-                    accept_energy = self.wake_accept_energy
-                    if barge_soft or (music_mode and not open_echo):
-                        accept_energy = max(0.006, accept_energy * 0.5)
-                    burst_ok, burst_peak, burst_floor = self._wake_burst_ok(
-                        recent_energy, accept_energy
-                    )
-                    if (
-                        use_gate
-                        and not barge_soft
-                        and floor_window
-                        and burst_ok
-                    ):
-                        play_floor = sorted(floor_window)[len(floor_window) // 2]
-                        if play_floor > 1e-6 and burst_peak < play_floor * BARGE_TTS_GATE_MULT:
-                            burst_ok = False
-                            burst_floor = play_floor
-                    armed = arm_sec <= 0.0 or (now - listen_started) >= arm_sec
-                    score_ok = best_score >= score_limit and burst_ok and armed
-                    if best_score >= score_limit and not burst_ok:
-                        if abs(best_score - last_score_log) >= 0.04:
+                    if best_score >= score_limit and not burst_ok and armed:
+                        if now - last_hold_log >= 0.4:
                             logger.info(
                                 "MWW hold %.3f energy=%.4f floor=%.4f "
                                 "(need energy≥%.3f and ≥%.1f×floor)",
@@ -934,7 +941,7 @@ class VoiceClient:
                                 accept_energy,
                                 WAKE_ENERGY_BURST_RATIO,
                             )
-                            last_score_log = best_score
+                            last_hold_log = now
                     if score_ok:
                         stable += 1
                     else:
@@ -2220,11 +2227,16 @@ class VoiceClient:
         energies,
         accept: float,
     ) -> tuple[bool, float, float]:
-        """True if recent RMS looks like speech, not a flat noise floor."""
+        """True if a recent RMS burst looks like speech, not a flat noise floor.
+
+        microWakeWord's score peaks after the word (sliding window), so the
+        burst is taken from the last WAKE_ENERGY_LOOKBACK frames, not only
+        the current 80 ms.
+        """
         vals = [float(x) for x in energies]
         if not vals:
             return False, 0.0, 0.0
-        peak = max(vals)
+        peak = max(vals[-WAKE_ENERGY_LOOKBACK:])
         body = vals[:-4] if len(vals) > 8 else vals
         ordered = sorted(body)
         floor = ordered[max(0, len(ordered) // 3)]
@@ -2307,7 +2319,7 @@ def main() -> None:
         "--wake-accept-energy",
         type=float,
         default=float(os.getenv("WAKE_ACCEPT_ENERGY", str(DEFAULT_WAKE_ACCEPT_ENERGY))),
-        help="Min RMS burst to accept a wake (rejects flat noise ~0.004)",
+        help="Min RMS burst to accept a wake (room speech ~0.006–0.013; rejects ~0.004 noise)",
     )
     parser.add_argument(
         "--wake-cooldown",
