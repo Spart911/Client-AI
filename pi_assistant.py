@@ -84,9 +84,9 @@ DEFAULT_MWW_CONFIG = "/app/models/ru_jarvis_mww.json"
 DEFAULT_WAKE_ACCEPT_ENERGY = 0.006
 # Peak in the recent window must also outrun the quiet floor.
 WAKE_ENERGY_BURST_RATIO = 2.5
-# Use energy from this many trailing 80 ms frames when the score catches up.
-WAKE_ENERGY_LOOKBACK = 12
-# Idle listen: at least this many 80 ms frames above score+energy.
+# Keep a speech burst alive while microWakeWord's score catches up (80 ms frames).
+WAKE_ENERGY_HANGOVER = 16
+# Idle listen: consecutive high-score frames while a recent burst is latched.
 WAKE_STABLE_MIN = 3
 # High-pass in front of RNNoise (Hz).
 DEFAULT_NOISE_HP_HZ = 280.0
@@ -669,6 +669,8 @@ class VoiceClient:
         last_heartbeat = 0.0
         last_score_log = 0.0
         last_hold_log = 0.0
+        energy_hangover = 0
+        latched_peak = 0.0
         peak_energy = 0.0
         peak_score = 0.0
         frames_seen = 0
@@ -682,6 +684,7 @@ class VoiceClient:
         def sync_music_duck() -> None:
             nonlocal use_gate, music_mode, speech_ducked, preroll, floor_window
             nonlocal stable, feeding, quiet_frames, reopen_after_music
+            nonlocal energy_hangover, latched_peak
             if not music_duck:
                 return
             playing = self._is_music_playing()
@@ -697,6 +700,8 @@ class VoiceClient:
                 quiet_frames = 0
                 speech_ducked = False
                 stable = 0
+                energy_hangover = 0
+                latched_peak = 0.0
                 self._mww.reset()
                 self._mww_features.reset()
                 self._duck_music(MUSIC_LISTEN_DUCK)
@@ -717,6 +722,8 @@ class VoiceClient:
                 feeding = False
                 quiet_frames = 0
                 stable = 0
+                energy_hangover = 0
+                latched_peak = 0.0
                 self._mww.reset()
                 self._mww_features.reset()
                 # Always reseat HFP after mpv — SCO often dies like after TTS.
@@ -897,8 +904,16 @@ class VoiceClient:
                         if play_floor > 1e-6 and burst_peak < play_floor * BARGE_TTS_GATE_MULT:
                             burst_ok = False
                             burst_floor = play_floor
+                    if burst_ok and frame_energy >= accept_energy:
+                        energy_hangover = WAKE_ENERGY_HANGOVER
+                        latched_peak = max(latched_peak, burst_peak, frame_energy)
+                    elif energy_hangover > 0:
+                        energy_hangover -= 1
+                        if energy_hangover == 0:
+                            latched_peak = 0.0
+                    energy_ok = energy_hangover > 0
                     armed = arm_sec <= 0.0 or (now - listen_started) >= arm_sec
-                    score_ok = best_score >= score_limit and burst_ok and armed
+                    score_ok = best_score >= score_limit and energy_ok and armed
 
                     if best_score >= 0.08 and (
                         abs(best_score - last_score_log) >= 0.04
@@ -907,7 +922,7 @@ class VoiceClient:
                             "MWW score %.3f energy=%.4f "
                             "(need score≥%.2f energy≥%.3f)%s",
                             best_score,
-                            burst_peak,
+                            latched_peak if energy_ok else burst_peak,
                             score_limit,
                             accept_energy,
                             " [music]" if music_mode else (
@@ -930,7 +945,7 @@ class VoiceClient:
                         peak_energy = 0.0
                         peak_score = 0.0
 
-                    if best_score >= score_limit and not burst_ok and armed:
+                    if best_score >= score_limit and not energy_ok and armed:
                         if now - last_hold_log >= 0.4:
                             logger.info(
                                 "MWW hold %.3f energy=%.4f floor=%.4f "
@@ -952,7 +967,7 @@ class VoiceClient:
                             "Wake matched (mww): %s score=%.3f energy=%.3f%s",
                             self._mww_wake_word or "mww",
                             best_score,
-                            max(recent_energy) if recent_energy else frame_energy,
+                            max(latched_peak, burst_peak),
                             " (music)" if music_mode else (
                                 " (barge)" if use_gate else ""
                             ),
@@ -2227,16 +2242,11 @@ class VoiceClient:
         energies,
         accept: float,
     ) -> tuple[bool, float, float]:
-        """True if a recent RMS burst looks like speech, not a flat noise floor.
-
-        microWakeWord's score peaks after the word (sliding window), so the
-        burst is taken from the last WAKE_ENERGY_LOOKBACK frames, not only
-        the current 80 ms.
-        """
+        """True if a recent RMS burst looks like speech, not a flat noise floor."""
         vals = [float(x) for x in energies]
         if not vals:
             return False, 0.0, 0.0
-        peak = max(vals[-WAKE_ENERGY_LOOKBACK:])
+        peak = max(vals)
         body = vals[:-4] if len(vals) > 8 else vals
         ordered = sorted(body)
         floor = ordered[max(0, len(ordered) // 3)]
