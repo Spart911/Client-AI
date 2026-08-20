@@ -1,12 +1,12 @@
 """
 title: Timer & Alarm (Pi living room)
 author: Client-AI
-version: 0.4.1
+version: 0.4.2
 description: >
   Ставит таймер/будильник через pi-alert:// на Raspberry Pi.
-  Клиент сам отсчитывает время и играет встроенный сигнал (не Яндекс-музыку).
+  В query уходит pi-alert://… — бэкенд кладёт это в очередь без Яндекса.
   Нужен тот же X-Music-Api-Key, что у «Yandex Music Player».
-  ВАЖНО: вставь этот файл в Open WebUI Tools заново после обновления.
+  ВАЖНО: обнови tool в Open WebUI и задеплой voice-assistant backend.
 required_open_webui_version: 0.4.0
 """
 
@@ -229,13 +229,11 @@ class Tools:
                 "В Valves укажи music_api_key — тот же ключ, что у "
                 "«Yandex Music Player»."
             )
+        # Backend MusicPlayRequest only accepts query+device_id.
+        # pi-alert:// in query is queued as-is (no Yandex search).
         payload = {
             "device_id": device,
-            "action": "play",
-            "url": alert_url,
-            "title": title,
-            "artist": "alert",
-            "source": "alert",
+            "query": alert_url,
         }
         endpoint = f"{backend}/v1/music/play"
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -250,7 +248,7 @@ class Tools:
         )
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
-                resp.read()
+                raw = resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:400]
             if exc.code == 401:
@@ -261,4 +259,11 @@ class Tools:
             return f"Бэкенд {endpoint} ответил {exc.code}: {detail}"
         except Exception as exc:
             return f"Не удалось отправить на Pi через {endpoint}: {exc}"
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+        if isinstance(data, dict) and data.get("success") is False:
+            return f"Бэкенд не принял таймер: {data.get('error') or raw[:200]}"
+        _ = title
         return ""
