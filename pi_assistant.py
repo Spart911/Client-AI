@@ -81,11 +81,11 @@ DEFAULT_WAKE_THRESHOLD = 0.90
 # Keep env from dropping too low (flat-noise false accepts lived at 0.85).
 WAKE_THRESHOLD_FLOOR = 0.90
 DEFAULT_MWW_CONFIG = "/app/models/ru_jarvis_mww.json"
-# Room «Джарвис» on USB often peaks ~0.005; louder takes ~0.01.
-# Flat noise / quiet false scores sat ~0.003. v2 is specific enough for 0.004.
-DEFAULT_WAKE_ACCEPT_ENERGY = 0.004
+# Room «Джарвис» on USB often peaks ~0.0034–0.005; louder takes ~0.01.
+# v2 is specific to the wake word — keep this under real speech energy.
+DEFAULT_WAKE_ACCEPT_ENERGY = 0.003
 # Peak in the recent window must also outrun the quiet floor.
-WAKE_ENERGY_BURST_RATIO = 2.5
+WAKE_ENERGY_BURST_RATIO = 2.0
 # Keep a speech burst alive while microWakeWord's score catches up (80 ms frames).
 WAKE_ENERGY_HANGOVER = 12
 # One loud frame is enough — score rises after the word while RMS falls.
@@ -1217,11 +1217,13 @@ class VoiceClient:
         frames: list[np.ndarray] = []
         silent = 0
         heard_live = False
-        listen_thread: threading.Thread | None = None
-        listen_done = threading.Event()
-        listen_done.set()
 
-        if preroll is not None and preroll.size:
+        # Ding first (blocking), then open the mic. Overlapping mpv+InputStream
+        # on A2DP often eats the listen chime; recording after the ding is also
+        # what the user expects to send to the model.
+        if play_listen_cue:
+            self._play_listen_cue()
+        elif preroll is not None and preroll.size:
             lead.append(preroll.astype(np.float32, copy=False))
 
         with sd.InputStream(
@@ -1230,23 +1232,6 @@ class VoiceClient:
             dtype="float32",
             blocksize=block,
         ) as stream:
-            if play_listen_cue:
-                # Capture-open glitch on A2DP: a short settle, then ding.
-                time.sleep(0.12)
-                listen_done.clear()
-
-                def _run_listen_cue() -> None:
-                    try:
-                        self._play_listen_cue()
-                    finally:
-                        listen_done.set()
-
-                listen_thread = threading.Thread(
-                    target=_run_listen_cue,
-                    name="listen-cue",
-                    daemon=True,
-                )
-                listen_thread.start()
             for index in range(max_blocks):
                 data, _ = stream.read(block)
                 mono = data[:, 0]
@@ -1263,15 +1248,13 @@ class VoiceClient:
                         silent = max(0, silent - 1)
                     else:
                         silent += 1
-                        # Wait until the listen ding finished, otherwise the
-                        # user is still waiting to speak and we ship "Jarvis".
-                        if silent >= silence_blocks and listen_done.is_set():
+                        if silent >= silence_blocks:
                             break
                 else:
                     frames.append(mono.copy())
                     if len(frames) > 5:
                         frames.pop(0)
-                    if listen_done.is_set() and index >= wait_blocks:
+                    if index >= wait_blocks:
                         break
 
             if heard_live:
@@ -1279,9 +1262,6 @@ class VoiceClient:
                 for _ in range(pad_blocks):
                     data, _ = stream.read(block)
                     frames.append(data[:, 0].copy())
-
-        if listen_thread is not None:
-            listen_thread.join(timeout=3.0)
 
         if heard_live:
             threading.Thread(
@@ -1321,9 +1301,11 @@ class VoiceClient:
         *,
         drain_sec: float = 0.0,
         audio_buffer: float = 0.2,
+        min_gain: float = 0.0,
     ) -> None:
         """Play a short chime. Prefer mpv (already used for TTS/music on A2DP)."""
-        audio = (audio * self._assistant_gain()).astype(np.float32, copy=False)
+        gain = max(float(min_gain), self._assistant_gain())
+        audio = (audio * gain).astype(np.float32, copy=False)
         duration = float(np.asarray(audio).shape[0]) / float(SAMPLE_RATE)
         fd, tmp_name = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
@@ -1394,9 +1376,13 @@ class VoiceClient:
         pre_sec: float,
         post_sec: float,
         label: str,
+        min_gain: float = 0.55,
     ) -> None:
         try:
             logger.info(label)
+            # Prefer the Bluetooth speaker when the card is up — mailbox/HDMI
+            # often becomes default after a BT drop and the ding is inaudible.
+            self._ensure_bt_playback_sink()
             rate = SAMPLE_RATE
             primed = np.concatenate(
                 [
@@ -1406,24 +1392,67 @@ class VoiceClient:
                 ]
             )
             with self._cue_lock:
-                self._play_chime_array(primed, drain_sec=0.02, audio_buffer=0.18)
+                self._play_chime_array(
+                    primed,
+                    drain_sec=0.05,
+                    audio_buffer=0.18,
+                    min_gain=min_gain,
+                )
         except Exception:
             logger.warning("%s playback failed", label, exc_info=True)
 
+    def _ensure_bt_playback_sink(self) -> None:
+        """Point Pulse default sink at A2DP when the BT card is connected."""
+        if not shutil.which("pactl"):
+            return
+        mac = (os.getenv("BT_DEVICE_MAC") or os.getenv("BT_MAC") or "").strip()
+        if not mac or self._bt_profile() != "a2dp_sink":
+            return
+        mac_us = mac.upper().replace(":", "_").replace("-", "_")
+        want = f"bluez_sink.{mac_us}.a2dp_sink"
+        try:
+            current = self._pulse_default_sink()
+            if current == want:
+                return
+            sinks = subprocess.check_output(
+                ["pactl", "list", "short", "sinks"],
+                text=True,
+                timeout=2,
+                stderr=subprocess.DEVNULL,
+            )
+            if want not in sinks:
+                return
+            subprocess.run(
+                ["pactl", "set-default-sink", want],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            logger.info("Cue sink → %s (was %s)", want, current or "?")
+        except Exception:
+            logger.debug("BT sink restore for cue failed", exc_info=True)
+
     def _play_listen_cue(self) -> None:
         self._play_cue(
-            self._make_chime(SAMPLE_RATE, 784.0, 0.11, 1046.5, 0.16),
-            pre_sec=0.05,
-            post_sec=0.18,
+            self._make_chime(
+                SAMPLE_RATE, 784.0, 0.12, 1046.5, 0.18, amplitude=0.32, harm=0.15
+            ),
+            pre_sec=0.02,
+            post_sec=0.12,
             label="Listen cue",
+            min_gain=0.65,
         )
 
     def _play_sent_cue(self) -> None:
         self._play_cue(
-            self._make_chime(SAMPLE_RATE, 880.0, 0.09, 659.3, 0.14, amplitude=0.20, harm=0.12),
-            pre_sec=0.04,
-            post_sec=0.16,
+            self._make_chime(
+                SAMPLE_RATE, 880.0, 0.09, 659.3, 0.14, amplitude=0.28, harm=0.12
+            ),
+            pre_sec=0.02,
+            post_sec=0.10,
             label="Sent cue",
+            min_gain=0.55,
         )
 
     @staticmethod
