@@ -16,3 +16,4 @@ _wtest
 logs/
 
 *.bak-v2
+*.bak-v3
