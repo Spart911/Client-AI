@@ -77,9 +77,9 @@ MUSIC_GATE_MULT = 1.08
 # Sentinel: music ended mid-listen — reopen InputStream after HFP reseat.
 _REOPEN_MIC = object()
 
-DEFAULT_WAKE_THRESHOLD = 0.94
-# Old Pi .env still has OWW_THRESHOLD=0.90 — floor so env cannot reopen FPs.
-WAKE_THRESHOLD_FLOOR = 0.93
+DEFAULT_WAKE_THRESHOLD = 0.90
+# Keep env from dropping too low (flat-noise false accepts lived at 0.85).
+WAKE_THRESHOLD_FLOOR = 0.90
 DEFAULT_MWW_CONFIG = "/app/models/ru_jarvis_mww.json"
 # Room «Джарвис» on the USB mic is ~0.006–0.013 RMS. Close-mic was ~0.02.
 # Flat false accepts sat at ~0.0036. Score peaks after the word (MWW window).
@@ -87,12 +87,11 @@ DEFAULT_WAKE_ACCEPT_ENERGY = 0.006
 # Peak in the recent window must also outrun the quiet floor.
 WAKE_ENERGY_BURST_RATIO = 2.5
 # Keep a speech burst alive while microWakeWord's score catches up (80 ms frames).
-# ~0.8s — enough for the MWW window; longer let clicks/keepalive false-fire.
-WAKE_ENERGY_HANGOVER = 10
-# «Джарвис» needs several loud frames; a click/tone spike is 1–2.
-WAKE_SPEECH_MIN_FRAMES = 4
+WAKE_ENERGY_HANGOVER = 12
+# Room «Джарвис» is often only 2 loud frames; score rises after the word.
+WAKE_SPEECH_MIN_FRAMES = 2
 # Idle listen: consecutive high-score frames while a recent burst is latched.
-WAKE_STABLE_MIN = 4
+WAKE_STABLE_MIN = 3
 # After a wake with no command, stay deaf longer (room noise often re-triggers).
 EMPTY_WAKE_COOLDOWN_SEC = 6.0
 # High-pass in front of RNNoise (Hz).
@@ -923,9 +922,8 @@ class VoiceClient:
                         host_playback = self._host_playback_active()
                         last_playback_check = now
                         if host_playback:
-                            energy_hangover = 0
-                            latched_peak = 0.0
-                            speech_latched = False
+                            # Don't clear the speech latch — only block accept while
+                            # paplay/keepalive is actually on the sink.
                             stable = 0
                     accept_energy = self.wake_accept_energy
                     if barge_soft or (music_mode and not open_echo):
@@ -946,14 +944,15 @@ class VoiceClient:
                     speech_frames = sum(
                         1 for e in recent_energy if e >= accept_energy * 0.85
                     )
+                    # Latch on the recent burst, not the current quiet frame —
+                    # MWW score peaks after «Джарвис» when RMS has already fallen.
                     if (
                         not host_playback
                         and burst_ok
-                        and frame_energy >= accept_energy
                         and speech_frames >= WAKE_SPEECH_MIN_FRAMES
                     ):
                         energy_hangover = WAKE_ENERGY_HANGOVER
-                        latched_peak = max(latched_peak, burst_peak, frame_energy)
+                        latched_peak = max(latched_peak, burst_peak)
                         speech_latched = True
                     elif energy_hangover > 0:
                         energy_hangover -= 1
@@ -999,16 +998,27 @@ class VoiceClient:
                         peak_energy = 0.0
                         peak_score = 0.0
 
-                    if best_score >= score_limit and not energy_ok and armed:
+                    if best_score >= score_limit and not score_ok and armed:
                         if now - last_hold_log >= 0.4:
+                            why = (
+                                "playback"
+                                if host_playback and not use_gate
+                                else (
+                                    "no-speech-latch"
+                                    if not speech_latched
+                                    else "hangover-expired"
+                                )
+                            )
                             logger.info(
-                                "MWW hold %.3f energy=%.4f floor=%.4f "
-                                "(need energy≥%.3f and ≥%.1f×floor)",
+                                "MWW hold %.3f energy=%.4f speech_frames=%d (%s; "
+                                "need score≥%.2f energy≥%.3f ×%d frames)",
                                 best_score,
                                 burst_peak,
-                                burst_floor,
+                                speech_frames,
+                                why,
+                                score_limit,
                                 accept_energy,
-                                WAKE_ENERGY_BURST_RATIO,
+                                WAKE_SPEECH_MIN_FRAMES,
                             )
                             last_hold_log = now
                     if score_ok:
@@ -2363,7 +2373,7 @@ def main() -> None:
         "--wake-threshold",
         type=float,
         default=_env_wake_threshold(),
-        help="Wake score threshold 0–1 (default 0.94, floor 0.93; also reads OWW_THRESHOLD)",
+        help="Wake score threshold 0–1 (default 0.90, floor 0.90; also reads OWW_THRESHOLD)",
     )
     parser.add_argument(
         "--mww-model-config",
