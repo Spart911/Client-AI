@@ -1,8 +1,11 @@
 """
 title: Timer & Alarm (Pi living room)
 author: Client-AI
-version: 0.1.0
-description: Ставит таймер или будильник на Raspberry Pi. Клиент сам отсчитывает время и играет сигнал.
+version: 0.4.0
+description: >
+  Ставит таймер/будильник через pi-alert:// на Raspberry Pi.
+  Клиент сам отсчитывает время и играет встроенный сигнал (не Яндекс-музыку).
+  ВАЖНО: вставь этот файл в Open WebUI Tools заново после обновления.
 required_open_webui_version: 0.4.0
 """
 

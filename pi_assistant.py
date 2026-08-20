@@ -735,9 +735,15 @@ class VoiceClient:
                 logger.info(
                     "Music on — duck×%.2f + %s",
                     MUSIC_LISTEN_DUCK,
-                    "open-echo gate (don't score speaker bleed)"
-                    if open_echo
-                    else "soft wake scoring over bleed",
+                    (
+                        "alert (Jarvis can dismiss)"
+                        if self._current_source == "alert"
+                        else (
+                            "open-echo gate (don't score speaker bleed)"
+                            if open_echo
+                            else "soft wake scoring over bleed"
+                        )
+                    ),
                 )
             elif not playing and music_mode:
                 music_mode = False
@@ -888,8 +894,11 @@ class VoiceClient:
                                 stable = 0
                         if not feeding:
                             pre_burst_f.append(frame_f.copy())
+                            # Alerts must stay dismissible by «Джарвис» even on
+                            # open speakers — otherwise the tone blocks wake.
+                            alert_playing = self._current_source == "alert"
                             score_under_gate = barge_soft or (
-                                music_mode and not open_echo
+                                music_mode and (not open_echo or alert_playing)
                             )
                             if not score_under_gate:
                                 continue
@@ -926,8 +935,9 @@ class VoiceClient:
                             # paplay/keepalive is actually on the sink.
                             stable = 0
                     accept_energy = self.wake_accept_energy
-                    if barge_soft or (music_mode and not open_echo):
-                        accept_energy = max(0.004, accept_energy * 0.5)
+                    alert_playing = self._current_source == "alert"
+                    if barge_soft or (music_mode and (not open_echo or alert_playing)):
+                        accept_energy = max(0.003, accept_energy * 0.5)
                     burst_ok, burst_peak, burst_floor = self._wake_burst_ok(
                         recent_energy, accept_energy
                     )
@@ -1818,7 +1828,12 @@ class VoiceClient:
                 str(job.get("sound") or "classic"),
             )
             media = str(tmp)
-        loop_file = "inf" if job.get("loop") else "4"
+        loop_file = "inf" if job.get("loop") else "2"
+        logger.info(
+            "Alert media=%s loop=%s",
+            "builtin" if tmp is not None else media[:80],
+            loop_file,
+        )
         self._start_music(media, source="alert", loop_file=loop_file)
 
     def _write_builtin_alert(self, kind: str, sound: str) -> Path:
