@@ -1,10 +1,11 @@
 """
 title: Timer & Alarm (Pi living room)
 author: Client-AI
-version: 0.4.0
+version: 0.4.1
 description: >
   Ставит таймер/будильник через pi-alert:// на Raspberry Pi.
   Клиент сам отсчитывает время и играет встроенный сигнал (не Яндекс-музыку).
+  Нужен тот же X-Music-Api-Key, что у «Yandex Music Player».
   ВАЖНО: вставь этот файл в Open WebUI Tools заново после обновления.
 required_open_webui_version: 0.4.0
 """
@@ -28,6 +29,10 @@ class Tools:
         backend_url: str = Field(
             default="http://voice.pora-ai.ru",
             description="VOICE_BACKEND_URL — тот же хост, что у Pi",
+        )
+        music_api_key: str = Field(
+            default="",
+            description="Тот же X-Music-Api-Key / MUSIC_API_KEY, что у «Yandex Music Player»",
         )
         device_id: str = Field(
             default="pi-livingroom",
@@ -63,6 +68,11 @@ class Tools:
         total = max(0, int(minutes or 0)) * 60 + max(0, int(seconds or 0))
         if total < 1:
             return "Укажи длительность таймера: секунды и/или минуты."
+        if not (self.valves.music_api_key or "").strip():
+            return (
+                "В Valves укажи music_api_key — тот же ключ, что у "
+                "«Yandex Music Player»."
+            )
         fire_at = int(time.time()) + total
         title = label.strip() or f"Таймер {self._fmt_duration(total)}"
         url = self._alert_url(
@@ -87,6 +97,11 @@ class Tools:
         :param sound: Имя мелодии из каталога Valves
         :param label: Необязательное название
         """
+        if not (self.valves.music_api_key or "").strip():
+            return (
+                "В Valves укажи music_api_key — тот же ключ, что у "
+                "«Yandex Music Player»."
+            )
         hhmm = self._parse_hhmm(time_hhmm)
         if hhmm is None:
             return "Время будильника не понял. Нужно ЧЧ:ММ, например 07:30."
@@ -206,8 +221,14 @@ class Tools:
     def _enqueue(self, alert_url: str, title: str) -> str:
         backend = (self.valves.backend_url or "").rstrip("/")
         device = (self.valves.device_id or "").strip()
+        api_key = (self.valves.music_api_key or "").strip()
         if not backend or not device:
             return "Заполни backend_url и device_id в Valves tool."
+        if not api_key:
+            return (
+                "В Valves укажи music_api_key — тот же ключ, что у "
+                "«Yandex Music Player»."
+            )
         payload = {
             "device_id": device,
             "action": "play",
@@ -221,7 +242,10 @@ class Tools:
         req = urllib.request.Request(
             endpoint,
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "X-Music-Api-Key": api_key,
+            },
             method="POST",
         )
         try:
@@ -229,6 +253,11 @@ class Tools:
                 resp.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:400]
+            if exc.code == 401:
+                return (
+                    "Бэкенд отверг music API key (401). "
+                    "Скопируй ключ из Valves «Yandex Music Player» в music_api_key."
+                )
             return f"Бэкенд {endpoint} ответил {exc.code}: {detail}"
         except Exception as exc:
             return f"Не удалось отправить на Pi через {endpoint}: {exc}"
