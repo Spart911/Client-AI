@@ -1302,72 +1302,116 @@ class VoiceClient:
         drain_sec: float = 0.0,
         audio_buffer: float = 0.2,
         min_gain: float = 0.0,
+        label: str = "cue",
     ) -> None:
-        """Play a short chime. Prefer mpv (already used for TTS/music on A2DP)."""
+        """Play a short chime on the Pulse default sink (A2DP).
+
+        Prefer paplay over mpv: mpv cold-start is slow, and A2DP often drops the
+        first ~200–400 ms after IDLE — a short ding vanishes even when rc=0.
+        """
         gain = max(float(min_gain), self._assistant_gain())
         audio = (audio * gain).astype(np.float32, copy=False)
-        duration = float(np.asarray(audio).shape[0]) / float(SAMPLE_RATE)
+        # Non-zero prime: digital silence does not wake a suspended A2DP link.
+        prime_n = int(SAMPLE_RATE * 0.40)
+        t = np.arange(prime_n, dtype=np.float32) / float(SAMPLE_RATE)
+        ramp = np.clip(t / 0.08, 0.0, 1.0)
+        prime = (np.sin(2.0 * np.pi * 160.0 * t) * 0.035 * ramp).astype(np.float32)
+        audio = np.concatenate([prime, audio])
+        duration = float(audio.shape[0]) / float(SAMPLE_RATE)
         fd, tmp_name = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
         path = Path(tmp_name)
         try:
             self._write_wav_pcm(path, audio, SAMPLE_RATE)
             env = os.environ.copy()
-            env.setdefault("PULSE_LATENCY_MSEC", "200")
-            mpv = (self.mpv_command or "").strip() or shutil.which("mpv")
-            timeout = max(8.0, duration + drain_sec + 3.0)
-            buf = max(0.15, float(audio_buffer))
+            env.setdefault("PULSE_LATENCY_MSEC", "60")
             sink = self._pulse_default_sink()
-            if mpv:
-                cmd = [
-                    mpv,
-                    "--no-video",
-                    "--really-quiet",
-                    "--no-terminal",
-                    f"--audio-buffer={buf:.2f}",
-                    "--volume=100",
-                ]
+            self._pulse_unsuspend_sink(sink)
+            timeout = max(8.0, duration + drain_sec + 3.0)
+            paplay = shutil.which("paplay")
+            backend = "none"
+            rc = -1
+            # Louder than assistant TTS volume so ding is obvious at 4/10.
+            paplay_vol = max(28000, int(65536 * max(0.55, gain)))
+            if paplay:
+                cmd = [paplay, f"--volume={paplay_vol}"]
                 if sink:
-                    cmd.append(f"--audio-device=pulse/{sink}")
+                    cmd.extend(["--device", sink])
                 cmd.append(str(path))
                 result = subprocess.run(
                     cmd,
                     check=False,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                     timeout=timeout,
                     env=env,
+                    text=True,
                 )
-                if result.returncode != 0:
-                    logger.warning("mpv chime failed rc=%s", result.returncode)
-                if drain_sec > 0:
-                    time.sleep(drain_sec)
-                return
-            paplay = shutil.which("paplay")
-            if paplay:
-                cmd = [paplay]
-                sink = self._pulse_default_sink()
-                if sink:
-                    cmd.extend(["--device", sink])
-                cmd.append(str(path))
-                subprocess.run(
-                    cmd,
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=timeout,
-                    env=env,
-                )
-                if drain_sec > 0:
-                    time.sleep(drain_sec)
-                return
-            sd.play(audio, SAMPLE_RATE, blocking=True)
+                backend = "paplay"
+                rc = int(result.returncode)
+                if rc != 0:
+                    err = (result.stderr or "").strip()[:200]
+                    logger.warning("paplay chime failed rc=%s %s", rc, err)
+            if backend == "none" or rc != 0:
+                mpv = (self.mpv_command or "").strip() or shutil.which("mpv")
+                if mpv:
+                    buf = max(0.15, float(audio_buffer))
+                    cmd = [
+                        mpv,
+                        "--no-video",
+                        "--really-quiet",
+                        "--no-terminal",
+                        f"--audio-buffer={buf:.2f}",
+                        "--volume=100",
+                    ]
+                    if sink:
+                        cmd.append(f"--audio-device=pulse/{sink}")
+                    cmd.append(str(path))
+                    result = subprocess.run(
+                        cmd,
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=timeout,
+                        env=env,
+                    )
+                    backend = "mpv"
+                    rc = int(result.returncode)
+                    if rc != 0:
+                        logger.warning("mpv chime failed rc=%s", rc)
+            if backend == "none":
+                sd.play(audio, SAMPLE_RATE, blocking=True)
+                backend = "sounddevice"
+                rc = 0
             if drain_sec > 0:
                 time.sleep(drain_sec)
+            logger.info(
+                "%s played via %s sink=%s dur=%.2fs gain=%.2f rc=%s",
+                label,
+                backend,
+                sink or "default",
+                duration,
+                gain,
+                rc,
+            )
         except Exception:
-            logger.warning("chime playback failed", exc_info=True)
+            logger.warning("%s playback failed", label, exc_info=True)
         finally:
             path.unlink(missing_ok=True)
+
+    def _pulse_unsuspend_sink(self, sink: str) -> None:
+        if not sink or not shutil.which("pactl"):
+            return
+        try:
+            subprocess.run(
+                ["pactl", "suspend-sink", sink, "0"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+        except Exception:
+            pass
 
     def _play_cue(
         self,
@@ -1379,11 +1423,11 @@ class VoiceClient:
         min_gain: float = 0.55,
     ) -> None:
         try:
-            logger.info(label)
             # Prefer the Bluetooth speaker when the card is up — mailbox/HDMI
             # often becomes default after a BT drop and the ding is inaudible.
             self._ensure_bt_playback_sink()
             rate = SAMPLE_RATE
+            # Tiny pad only — A2DP prime lives inside _play_chime_array (non-zero).
             primed = np.concatenate(
                 [
                     np.zeros(max(0, int(rate * pre_sec)), dtype=np.float32),
@@ -1394,9 +1438,10 @@ class VoiceClient:
             with self._cue_lock:
                 self._play_chime_array(
                     primed,
-                    drain_sec=0.05,
+                    drain_sec=0.08,
                     audio_buffer=0.18,
                     min_gain=min_gain,
+                    label=label,
                 )
         except Exception:
             logger.warning("%s playback failed", label, exc_info=True)
@@ -1434,25 +1479,26 @@ class VoiceClient:
             logger.debug("BT sink restore for cue failed", exc_info=True)
 
     def _play_listen_cue(self) -> None:
+        # Longer / louder two-tone so A2DP has something left after the prime.
         self._play_cue(
             self._make_chime(
-                SAMPLE_RATE, 784.0, 0.12, 1046.5, 0.18, amplitude=0.32, harm=0.15
+                SAMPLE_RATE, 880.0, 0.16, 1174.0, 0.22, amplitude=0.42, harm=0.12
             ),
-            pre_sec=0.02,
-            post_sec=0.12,
+            pre_sec=0.0,
+            post_sec=0.05,
             label="Listen cue",
-            min_gain=0.65,
+            min_gain=0.75,
         )
 
     def _play_sent_cue(self) -> None:
         self._play_cue(
             self._make_chime(
-                SAMPLE_RATE, 880.0, 0.09, 659.3, 0.14, amplitude=0.28, harm=0.12
+                SAMPLE_RATE, 988.0, 0.10, 740.0, 0.16, amplitude=0.34, harm=0.10
             ),
-            pre_sec=0.02,
-            post_sec=0.10,
+            pre_sec=0.0,
+            post_sec=0.04,
             label="Sent cue",
-            min_gain=0.55,
+            min_gain=0.65,
         )
 
     @staticmethod
