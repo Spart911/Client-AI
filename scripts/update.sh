@@ -141,3 +141,13 @@ if command -v curl >/dev/null 2>&1; then
 fi
 
 echo "Updated ${LOCAL:0:8} → ${REMOTE:0:8} — container healthy"
+
+# Host BT keepalive script lives outside the container — bounce it so
+# scripts/bt-connect.sh changes (volume/tone) apply without a reboot.
+if command -v systemctl >/dev/null 2>&1; then
+  if systemctl --user is-active --quiet voice-bt-connect.service 2>/dev/null; then
+    systemctl --user restart voice-bt-connect.service 2>/dev/null \
+      && echo "Restarted voice-bt-connect.service" \
+      || echo "WARNING: could not restart voice-bt-connect.service" >&2
+  fi
+fi

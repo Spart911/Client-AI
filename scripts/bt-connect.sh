@@ -43,8 +43,8 @@ INTERVAL="${BT_CONNECT_INTERVAL:-15}"
 ONCE="${BT_CONNECT_ONCE:-false}"
 # Default: blip every 2 min (HFP-audible tone; 40 Hz was filtered and useless).
 KEEPALIVE_SEC="${BT_KEEPALIVE_SEC:-120}"
-KEEPALIVE_VOL="${BT_KEEPALIVE_VOL:-3500}"  # paplay 0..65536; ~5% — soft but present
-KEEPALIVE_WAV="${BT_KEEPALIVE_WAV:-/tmp/voice-bt-keepalive-v2.wav}"
+KEEPALIVE_VOL="${BT_KEEPALIVE_VOL:-1200}"  # paplay 0..65536; ~2% — wake-safe
+KEEPALIVE_WAV="${BT_KEEPALIVE_WAV:-/tmp/voice-bt-keepalive-v3.wav}"
 _last_keepalive_ts=0
 LOG_FILE="${BT_LOG_FILE:-${SCRIPT_DIR}/logs/bt-connect.log}"
 mkdir -p "$(dirname "${LOG_FILE}")"
@@ -214,7 +214,7 @@ apply_pulse() {
 
 ensure_keepalive_wav() {
   # HFP is ~300–3400 Hz: a 40 Hz tone never reaches the speaker amp.
-  # Soft 700 Hz / ~350 ms — quiet tick, enough for most auto-off timers.
+  # Soft 900 Hz / ~120 ms — short enough that wake needs ≥4 loud frames to miss it.
   if [[ -f "${KEEPALIVE_WAV}" ]]; then
     return 0
   fi
@@ -222,7 +222,7 @@ ensure_keepalive_wav() {
 import math, struct, sys, wave
 
 path = sys.argv[1]
-rate, dur, freq, amp = 16000, 0.35, 700.0, 900  # amp out of 32767 (~2.7%)
+rate, dur, freq, amp = 16000, 0.12, 900.0, 500  # amp out of 32767 (~1.5%)
 n = max(1, int(rate * dur))
 with wave.open(path, "w") as w:
     w.setnchannels(1)
@@ -275,6 +275,11 @@ maybe_keepalive() {
   local sink vol
   sink="$(pactl get-default-sink 2>/dev/null || true)"
   vol="${KEEPALIVE_VOL}"
+  # A2DP + USB mic: loud keepalive echoes into the wake mic.
+  if [[ "${PROFILE}" == "a2dp_sink" ]] && [[ "${vol}" =~ ^[0-9]+$ ]] && (( vol > 1500 )); then
+    log "keepalive vol ${vol}→1500 (a2dp wake-safe cap)"
+    vol=1500
+  fi
   # paplay --volume: 0..65536
   if [[ -n "${sink}" ]]; then
     paplay --device="${sink}" --volume="${vol}" "${KEEPALIVE_WAV}" >/dev/null 2>&1 || true
@@ -307,8 +312,8 @@ cycle() {
 }
 
 log "MAC=${mac_norm} profile=${PROFILE} interval=${INTERVAL}s keepalive=${KEEPALIVE_SEC}s vol=${KEEPALIVE_VOL}"
-# Drop legacy inaudible 40 Hz sample if present.
-rm -f /tmp/voice-bt-keepalive.wav 2>/dev/null || true
+# Drop legacy keepalive samples if present.
+rm -f /tmp/voice-bt-keepalive.wav /tmp/voice-bt-keepalive-v2.wav 2>/dev/null || true
 _last_keepalive_ts="$(date +%s)"
 cycle
 

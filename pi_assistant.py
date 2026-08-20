@@ -85,7 +85,10 @@ DEFAULT_WAKE_ACCEPT_ENERGY = 0.006
 # Peak in the recent window must also outrun the quiet floor.
 WAKE_ENERGY_BURST_RATIO = 2.5
 # Keep a speech burst alive while microWakeWord's score catches up (80 ms frames).
-WAKE_ENERGY_HANGOVER = 16
+# ~0.8s — enough for the MWW window; longer let clicks/keepalive false-fire.
+WAKE_ENERGY_HANGOVER = 10
+# «Джарвис» needs several loud frames; a click/tone spike is 1–2.
+WAKE_SPEECH_MIN_FRAMES = 4
 # Idle listen: consecutive high-score frames while a recent burst is latched.
 WAKE_STABLE_MIN = 3
 # High-pass in front of RNNoise (Hz).
@@ -669,8 +672,11 @@ class VoiceClient:
         last_heartbeat = 0.0
         last_score_log = 0.0
         last_hold_log = 0.0
+        last_playback_check = 0.0
+        host_playback = False
         energy_hangover = 0
         latched_peak = 0.0
+        speech_latched = False
         peak_energy = 0.0
         peak_score = 0.0
         frames_seen = 0
@@ -684,7 +690,7 @@ class VoiceClient:
         def sync_music_duck() -> None:
             nonlocal use_gate, music_mode, speech_ducked, preroll, floor_window
             nonlocal stable, feeding, quiet_frames, reopen_after_music
-            nonlocal energy_hangover, latched_peak
+            nonlocal energy_hangover, latched_peak, speech_latched
             if not music_duck:
                 return
             playing = self._is_music_playing()
@@ -702,6 +708,7 @@ class VoiceClient:
                 stable = 0
                 energy_hangover = 0
                 latched_peak = 0.0
+                speech_latched = False
                 self._mww.reset()
                 self._mww_features.reset()
                 self._duck_music(MUSIC_LISTEN_DUCK)
@@ -724,6 +731,7 @@ class VoiceClient:
                 stable = 0
                 energy_hangover = 0
                 latched_peak = 0.0
+                speech_latched = False
                 self._mww.reset()
                 self._mww_features.reset()
                 # Always reseat HFP after mpv — SCO often dies like after TTS.
@@ -888,6 +896,16 @@ class VoiceClient:
                     peak_score = max(peak_score, best_score)
 
                     now = time.monotonic()
+                    # Idle wake: ignore acoustic echo from host keepalive / other paplay.
+                    # Barge-in (use_gate) must keep listening over our own TTS.
+                    if not use_gate and now - last_playback_check >= 0.25:
+                        host_playback = self._host_playback_active()
+                        last_playback_check = now
+                        if host_playback:
+                            energy_hangover = 0
+                            latched_peak = 0.0
+                            speech_latched = False
+                            stable = 0
                     accept_energy = self.wake_accept_energy
                     if barge_soft or (music_mode and not open_echo):
                         accept_energy = max(0.004, accept_energy * 0.5)
@@ -904,16 +922,31 @@ class VoiceClient:
                         if play_floor > 1e-6 and burst_peak < play_floor * BARGE_TTS_GATE_MULT:
                             burst_ok = False
                             burst_floor = play_floor
-                    if burst_ok and frame_energy >= accept_energy:
+                    speech_frames = sum(
+                        1 for e in recent_energy if e >= accept_energy * 0.85
+                    )
+                    if (
+                        not host_playback
+                        and burst_ok
+                        and frame_energy >= accept_energy
+                        and speech_frames >= WAKE_SPEECH_MIN_FRAMES
+                    ):
                         energy_hangover = WAKE_ENERGY_HANGOVER
                         latched_peak = max(latched_peak, burst_peak, frame_energy)
+                        speech_latched = True
                     elif energy_hangover > 0:
                         energy_hangover -= 1
                         if energy_hangover == 0:
                             latched_peak = 0.0
-                    energy_ok = energy_hangover > 0
+                            speech_latched = False
+                    energy_ok = energy_hangover > 0 and speech_latched
                     armed = arm_sec <= 0.0 or (now - listen_started) >= arm_sec
-                    score_ok = best_score >= score_limit and energy_ok and armed
+                    score_ok = (
+                        best_score >= score_limit
+                        and energy_ok
+                        and armed
+                        and not (host_playback and not use_gate)
+                    )
 
                     if best_score >= 0.08 and (
                         abs(best_score - last_score_log) >= 0.04
@@ -1976,6 +2009,21 @@ class VoiceClient:
         except Exception:
             return False
         return "bluez" in sink.lower()
+
+    def _host_playback_active(self) -> bool:
+        """True if Pulse already has a sink-input (keepalive, music, TTS, …)."""
+        if not shutil.which("pactl"):
+            return False
+        try:
+            out = subprocess.check_output(
+                ["pactl", "list", "short", "sink-inputs"],
+                text=True,
+                timeout=1.5,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            return False
+        return any(line.strip() for line in out.splitlines())
 
     def _open_speaker_echo(self) -> bool:
         """True when a room speaker plays into a separate mic (A2DP + USB)."""
