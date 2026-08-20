@@ -77,7 +77,9 @@ MUSIC_GATE_MULT = 1.08
 # Sentinel: music ended mid-listen — reopen InputStream after HFP reseat.
 _REOPEN_MIC = object()
 
-DEFAULT_WAKE_THRESHOLD = 0.90
+DEFAULT_WAKE_THRESHOLD = 0.94
+# Old Pi .env still has OWW_THRESHOLD=0.90 — floor so env cannot reopen FPs.
+WAKE_THRESHOLD_FLOOR = 0.93
 DEFAULT_MWW_CONFIG = "/app/models/ru_jarvis_mww.json"
 # Room «Джарвис» on the USB mic is ~0.006–0.013 RMS. Close-mic was ~0.02.
 # Flat false accepts sat at ~0.0036. Score peaks after the word (MWW window).
@@ -90,7 +92,9 @@ WAKE_ENERGY_HANGOVER = 10
 # «Джарвис» needs several loud frames; a click/tone spike is 1–2.
 WAKE_SPEECH_MIN_FRAMES = 4
 # Idle listen: consecutive high-score frames while a recent burst is latched.
-WAKE_STABLE_MIN = 3
+WAKE_STABLE_MIN = 4
+# After a wake with no command, stay deaf longer (room noise often re-triggers).
+EMPTY_WAKE_COOLDOWN_SEC = 6.0
 # High-pass in front of RNNoise (Hz).
 DEFAULT_NOISE_HP_HZ = 280.0
 
@@ -313,7 +317,16 @@ class VoiceClient:
             self.wake_words = list(dict.fromkeys(normalized)) or [label]
         else:
             self.wake_words = [label]
-        self.wake_threshold = float(np.clip(wake_threshold, 0.05, 0.99))
+        self.wake_threshold = float(
+            np.clip(max(WAKE_THRESHOLD_FLOOR, wake_threshold), 0.05, 0.99)
+        )
+        if wake_threshold < WAKE_THRESHOLD_FLOOR:
+            logger.warning(
+                "Wake threshold %.2f is below floor %.2f — using %.2f",
+                wake_threshold,
+                WAKE_THRESHOLD_FLOOR,
+                self.wake_threshold,
+            )
         self.mww_model_config = (mww_model_config or DEFAULT_MWW_CONFIG).strip()
         self.silence_sec = silence_sec
         self.max_utterance_sec = max_utterance_sec
@@ -403,7 +416,15 @@ class VoiceClient:
                 )
                 if not wav_bytes:
                     if not interrupted:
-                        logger.warning("Empty recording, back to wake listen")
+                        # Likely false wake: no command followed the trigger.
+                        self._last_wake_ts = time.monotonic() + max(
+                            0.0,
+                            EMPTY_WAKE_COOLDOWN_SEC - self.wake_cooldown_sec,
+                        )
+                        logger.warning(
+                            "Empty recording after wake — cooldown %.1fs, back to listen",
+                            EMPTY_WAKE_COOLDOWN_SEC,
+                        )
                     break
                 preroll = self._assist_and_play(wav_bytes)
                 self._last_wake_ts = time.monotonic()
@@ -2342,7 +2363,7 @@ def main() -> None:
         "--wake-threshold",
         type=float,
         default=_env_wake_threshold(),
-        help="Wake score threshold 0–1 (default 0.90; also reads OWW_THRESHOLD)",
+        help="Wake score threshold 0–1 (default 0.94, floor 0.93; also reads OWW_THRESHOLD)",
     )
     parser.add_argument(
         "--mww-model-config",
