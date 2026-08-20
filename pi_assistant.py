@@ -81,15 +81,15 @@ DEFAULT_WAKE_THRESHOLD = 0.90
 # Keep env from dropping too low (flat-noise false accepts lived at 0.85).
 WAKE_THRESHOLD_FLOOR = 0.90
 DEFAULT_MWW_CONFIG = "/app/models/ru_jarvis_mww.json"
-# Room «Джарвис» on the USB mic is ~0.006–0.013 RMS. Close-mic was ~0.02.
-# Flat false accepts sat at ~0.0036. Score peaks after the word (MWW window).
-DEFAULT_WAKE_ACCEPT_ENERGY = 0.006
+# Room «Джарвис» on USB often peaks ~0.005; louder takes ~0.01.
+# Flat noise / quiet false scores sat ~0.003. v2 is specific enough for 0.004.
+DEFAULT_WAKE_ACCEPT_ENERGY = 0.004
 # Peak in the recent window must also outrun the quiet floor.
 WAKE_ENERGY_BURST_RATIO = 2.5
 # Keep a speech burst alive while microWakeWord's score catches up (80 ms frames).
 WAKE_ENERGY_HANGOVER = 12
-# Room «Джарвис» is often only 2 loud frames; score rises after the word.
-WAKE_SPEECH_MIN_FRAMES = 2
+# One loud frame is enough — score rises after the word while RMS falls.
+WAKE_SPEECH_MIN_FRAMES = 1
 # Idle listen: consecutive high-score frames while a recent burst is latched.
 WAKE_STABLE_MIN = 3
 # After a wake with no command, stay deaf longer (room noise often re-triggers).
