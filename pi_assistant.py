@@ -18,21 +18,27 @@ import os
 import queue
 import re
 import shutil
-import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
-import uuid
 import wave
 from collections import deque
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 import numpy as np
 import sounddevice as sd
+
+from alert_scheduler import AlertScheduler
+from bt_audio import BtAudio
+from music_poller import MusicPoller
+from playback_engine import (
+    BARGE_PLAYBACK_GAIN as _PE_BARGE_PLAYBACK_GAIN,
+    MUSIC_LISTEN_DUCK as _PE_MUSIC_LISTEN_DUCK,
+    PlaybackEngine,
+    TTS_END_PAD_SEC as _PE_TTS_END_PAD_SEC,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,7 +62,7 @@ BARGE_FLOOR_FRAMES = 24
 BARGE_ARM_SEC = 0.50
 # Soften the reply while we listen for an interrupt — leaves headroom for the
 # mic at any system volume (bleed scales with the speakers, the user's voice does not).
-BARGE_PLAYBACK_GAIN = 0.62
+BARGE_PLAYBACK_GAIN = _PE_BARGE_PLAYBACK_GAIN
 # Keep feeding the wake model this long after a burst dips under the gate.
 BARGE_HANGOVER_FRAMES = 4
 # Replay the frames just before the burst so the wake phrase keeps its onset.
@@ -66,10 +72,10 @@ BARGE_COMMAND_WAIT_SEC = 5.0
 # After silence is detected, keep a short pad so word endings aren't clipped.
 RECORD_END_PAD_SEC = 0.12
 # Quiet tail after TTS so ALSA/Pulse underruns don't eat the last syllable.
-TTS_END_PAD_SEC = 0.35
+TTS_END_PAD_SEC = _PE_TTS_END_PAD_SEC
 # While waiting for wake with music on: keep mpv quieter so speech
 # can clear the mic without shouting (fraction of the user's 1–10 volume).
-MUSIC_LISTEN_DUCK = 0.35
+MUSIC_LISTEN_DUCK = _PE_MUSIC_LISTEN_DUCK
 # Extra duck once a speech burst is heard over the music floor.
 MUSIC_SPEECH_DUCK = 0.12
 # Gate over music bleed (slightly softer than TTS barge-in).
@@ -349,22 +355,29 @@ class VoiceClient:
         self._mww_wake_word = ""
         self._wake_mode = "none"
         self._last_wake_ts = 0.0
-        self._music_proc: subprocess.Popen | None = None
-        self._music_lock = threading.Lock()
-        self._cue_lock = threading.Lock()
-        self._music_stop = threading.Event()
-        self._alert_stop = threading.Event()
-        self._alert_cv = threading.Condition()
-        self._alerts: list[dict] = []
-        self._current_track_id = ""
-        self._current_source = ""
-        self._volume_level = 7  # 1..10
-        self._mpv_ipc_path = Path(tempfile.gettempdir()) / f"voice-mpv-{os.getpid()}.sock"
-        self._in_wake_listen = False
         # Reuse TCP/TLS across assist + music polls (saves handshake each turn).
         self._http = httpx.Client(
             timeout=httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0),
             limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+        )
+        self.bt = BtAudio()
+        self.playback = PlaybackEngine(
+            self.bt,
+            mpv_command=self.mpv_command,
+            backend_url=self.backend_url,
+            device_id=self.device_id,
+            http_client=self._http,
+            barge_in=self.barge_in,
+        )
+        self.alerts = AlertScheduler(playback=self.playback, http_client=self._http)
+        self.music = MusicPoller(
+            backend_url=self.backend_url,
+            device_id=self.device_id,
+            http_client=self._http,
+            playback=self.playback,
+            alerts=self.alerts,
+            enabled=self.music_poll,
+            interval=self.music_poll_interval,
         )
 
     def run(self) -> None:
@@ -378,13 +391,14 @@ class VoiceClient:
         self._configure_audio_device()
         # Bluetooth HFP SCO often arrives wedged after reboot/TTS — reseat before listen.
         if (os.getenv("BT_DEVICE_MAC") or os.getenv("BT_MAC") or "").strip():
-            self._restore_hfp_audio()
+            self.bt.restore_hfp_audio()
         self._warmup_backend()
         self._init_wake()
-        self._sync_volume_from_backend()
+        self.playback.set_barge_watch(self._watch_barge_in)
+        self.music.sync_volume_from_backend()
         if self.music_poll:
-            self._start_music_poller()
-        self._start_alert_scheduler()
+            self.music.start()
+        self.alerts.start()
         wake_label = self._mww_wake_word or (self.wake_words[0] if self.wake_words else "Джарвис")
         logger.info(
             "Wake mode: %s — say «%s …» then your command.",
@@ -402,7 +416,7 @@ class VoiceClient:
 
         while True:
             preroll = self._wait_for_wake()
-            self._stop_music()
+            self.playback.stop_music()
             self._last_wake_ts = time.monotonic()
             logger.info("Wake detected — capturing command")
             interrupted = False
@@ -633,7 +647,7 @@ class VoiceClient:
     def _wait_for_wake(self) -> np.ndarray | None:
         if self._wake_mode != "mww":
             raise RuntimeError("Wake engine is not initialized")
-        self._in_wake_listen = True
+        self.playback.in_wake_listen = True
         try:
             # echo_gate starts False; sync_music_duck toggles it when mpv starts.
             # Reopen the mic stream after music ends so HFP SCO is not stale.
@@ -647,7 +661,7 @@ class VoiceClient:
                     continue
                 return result
         finally:
-            self._in_wake_listen = False
+            self.playback.in_wake_listen = False
 
     def _wait_mww(
         self,
@@ -684,7 +698,7 @@ class VoiceClient:
         floor_len = BARGE_FLOOR_FRAMES if use_gate and not barge_soft else 16
         floor_window: deque[float] = deque(maxlen=floor_len)
         listen_started = time.monotonic()
-        open_echo = self._open_speaker_echo()
+        open_echo = self.bt.open_speaker_echo()
         pre_burst_f: deque[np.ndarray] = deque(maxlen=BARGE_ONSET_FRAMES)
         feeding = False
         quiet_frames = 0
@@ -713,7 +727,7 @@ class VoiceClient:
             nonlocal energy_hangover, latched_peak, speech_latched
             if not music_duck:
                 return
-            playing = self._is_music_playing()
+            playing = self.playback.is_music_playing()
             if playing and not music_mode:
                 music_mode = True
                 use_gate = True
@@ -733,13 +747,13 @@ class VoiceClient:
                 self._mww_features.reset()
                 # Keep alerts at full volume — ducking them invites false wakes
                 # (quiet ring + loud bleed scoring) and makes the cue hard to hear.
-                if self._current_source != "alert":
-                    self._duck_music(MUSIC_LISTEN_DUCK)
+                if self.playback.current_source != "alert":
+                    self.playback.duck_music(MUSIC_LISTEN_DUCK)
                 logger.info(
                     "Music on — %s",
                     (
                         "alert (Jarvis only above playback gate)"
-                        if self._current_source == "alert"
+                        if self.playback.current_source == "alert"
                         else (
                             f"duck×{MUSIC_LISTEN_DUCK:.2f} + open-echo gate "
                             "(don't score speaker bleed)"
@@ -764,7 +778,7 @@ class VoiceClient:
                 self._mww.reset()
                 self._mww_features.reset()
                 # Always reseat HFP after mpv — SCO often dies like after TTS.
-                self._restore_hfp_audio()
+                self.bt.restore_hfp_audio()
                 reopen_after_music = True
                 logger.info("Music off — cleared wake gate, restored HFP")
 
@@ -782,13 +796,13 @@ class VoiceClient:
                 return
             # Never duck an alert: relative speech-gate sees the ringtone itself
             # as "user speech" and was silencing ~15s timers after ~1s.
-            if self._current_source == "alert":
+            if self.playback.current_source == "alert":
                 return
             if active:
-                self._duck_music(MUSIC_SPEECH_DUCK)
+                self.playback.duck_music(MUSIC_SPEECH_DUCK)
                 speech_ducked = True
             elif speech_ducked:
-                self._duck_music(MUSIC_LISTEN_DUCK)
+                self.playback.duck_music(MUSIC_LISTEN_DUCK)
                 speech_ducked = False
 
         logger.info(
@@ -885,7 +899,7 @@ class VoiceClient:
                             # Open-echo alert: ringtone IS the floor — do not enter
                             # feeding/MWW on self-bleed (that also used to duck it).
                             alert_open = (
-                                open_echo and self._current_source == "alert"
+                                open_echo and self.playback.current_source == "alert"
                             )
                             if not feeding and not alert_open:
                                 set_feeding(True)
@@ -947,7 +961,7 @@ class VoiceClient:
                     # Idle wake: ignore acoustic echo from host keepalive / other paplay.
                     # Barge-in (use_gate) must keep listening over our own TTS.
                     if not use_gate and now - last_playback_check >= 0.25:
-                        host_playback = self._host_playback_active()
+                        host_playback = self.bt.host_playback_active()
                         last_playback_check = now
                         if host_playback:
                             # Don't clear the speech latch — only block accept while
@@ -1067,7 +1081,7 @@ class VoiceClient:
                         return self._preroll_array(preroll)
         finally:
             if music_duck and music_mode:
-                self._restore_music_volume()
+                self.playback.restore_music_volume()
 
     def _preroll_array(self, preroll) -> np.ndarray | None:
         if not preroll:
@@ -1106,6 +1120,7 @@ class VoiceClient:
         # Pause music polling so the Pi isn't competing for CPU/network mid-assist.
         music_was = self.music_poll
         self.music_poll = False
+        self.music.music_poll = False
         try:
             files = {"file": ("command.wav", wav_bytes, "audio/wav")}
             data = {
@@ -1161,12 +1176,12 @@ class VoiceClient:
             if reply:
                 logger.info("OWUI: %s", reply)
             if audio:
-                preroll = self._play_wav(audio, reply_text=reply)
+                preroll = self.playback.play_wav(audio, reply_text=reply)
             else:
                 logger.error("Assist response has no audio payload")
                 preroll = None
             if playback:
-                self._handle_playback(playback)
+                self.music.handle_playback(playback)
             logger.info(
                 "Assist total=%.1fs (play included)",
                 time.monotonic() - t0,
@@ -1174,6 +1189,7 @@ class VoiceClient:
             return preroll
         finally:
             self.music_poll = music_was
+            self.music.music_poll = music_was
 
     def _parse_assist_body(
         self,
@@ -1250,7 +1266,7 @@ class VoiceClient:
         # on A2DP often eats the listen chime; recording after the ding is also
         # what the user expects to send to the model.
         if play_listen_cue:
-            self._play_listen_cue()
+            self.playback.play_listen_cue()
         elif preroll is not None and preroll.size:
             lead.append(preroll.astype(np.float32, copy=False))
 
@@ -1293,7 +1309,7 @@ class VoiceClient:
 
         if heard_live:
             threading.Thread(
-                target=self._play_sent_cue,
+                target=self.playback.play_sent_cue,
                 name="sent-cue",
                 daemon=True,
             ).start()
@@ -1312,1103 +1328,12 @@ class VoiceClient:
             return b""
         return self._frames_to_wav(audio)
 
-    def _pulse_default_sink(self) -> str:
-        try:
-            return subprocess.check_output(
-                ["pactl", "get-default-sink"],
-                text=True,
-                timeout=2,
-                stderr=subprocess.DEVNULL,
-            ).strip()
-        except Exception:
-            return ""
 
-    def _play_chime_array(
-        self,
-        audio: np.ndarray,
-        *,
-        drain_sec: float = 0.0,
-        audio_buffer: float = 0.2,
-        min_gain: float = 0.0,
-        label: str = "cue",
-    ) -> None:
-        """Play a short chime on the Pulse default sink (A2DP).
 
-        Prefer paplay over mpv: mpv cold-start is slow, and A2DP often drops the
-        first ~200–400 ms after IDLE — a short ding vanishes even when rc=0.
-        """
-        gain = max(float(min_gain), self._assistant_gain())
-        audio = (audio * gain).astype(np.float32, copy=False)
-        # Non-zero prime: digital silence does not wake a suspended A2DP link.
-        prime_n = int(SAMPLE_RATE * 0.40)
-        t = np.arange(prime_n, dtype=np.float32) / float(SAMPLE_RATE)
-        ramp = np.clip(t / 0.08, 0.0, 1.0)
-        prime = (np.sin(2.0 * np.pi * 160.0 * t) * 0.035 * ramp).astype(np.float32)
-        audio = np.concatenate([prime, audio])
-        duration = float(audio.shape[0]) / float(SAMPLE_RATE)
-        fd, tmp_name = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-        path = Path(tmp_name)
-        try:
-            self._write_wav_pcm(path, audio, SAMPLE_RATE)
-            env = os.environ.copy()
-            env.setdefault("PULSE_LATENCY_MSEC", "60")
-            sink = self._pulse_default_sink()
-            self._pulse_unsuspend_sink(sink)
-            timeout = max(8.0, duration + drain_sec + 3.0)
-            paplay = shutil.which("paplay")
-            backend = "none"
-            rc = -1
-            # Louder than assistant TTS volume so ding is obvious at 4/10.
-            paplay_vol = max(28000, int(65536 * max(0.55, gain)))
-            if paplay:
-                cmd = [paplay, f"--volume={paplay_vol}"]
-                if sink:
-                    cmd.extend(["--device", sink])
-                cmd.append(str(path))
-                result = subprocess.run(
-                    cmd,
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    timeout=timeout,
-                    env=env,
-                    text=True,
-                )
-                backend = "paplay"
-                rc = int(result.returncode)
-                if rc != 0:
-                    err = (result.stderr or "").strip()[:200]
-                    logger.warning("paplay chime failed rc=%s %s", rc, err)
-            if backend == "none" or rc != 0:
-                mpv = (self.mpv_command or "").strip() or shutil.which("mpv")
-                if mpv:
-                    buf = max(0.15, float(audio_buffer))
-                    cmd = [
-                        mpv,
-                        "--no-video",
-                        "--really-quiet",
-                        "--no-terminal",
-                        f"--audio-buffer={buf:.2f}",
-                        "--volume=100",
-                    ]
-                    if sink:
-                        cmd.append(f"--audio-device=pulse/{sink}")
-                    cmd.append(str(path))
-                    result = subprocess.run(
-                        cmd,
-                        check=False,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=timeout,
-                        env=env,
-                    )
-                    backend = "mpv"
-                    rc = int(result.returncode)
-                    if rc != 0:
-                        logger.warning("mpv chime failed rc=%s", rc)
-            if backend == "none":
-                sd.play(audio, SAMPLE_RATE, blocking=True)
-                backend = "sounddevice"
-                rc = 0
-            if drain_sec > 0:
-                time.sleep(drain_sec)
-            logger.info(
-                "%s played via %s sink=%s dur=%.2fs gain=%.2f rc=%s",
-                label,
-                backend,
-                sink or "default",
-                duration,
-                gain,
-                rc,
-            )
-        except Exception:
-            logger.warning("%s playback failed", label, exc_info=True)
-        finally:
-            path.unlink(missing_ok=True)
 
-    def _pulse_unsuspend_sink(self, sink: str) -> None:
-        if not sink or not shutil.which("pactl"):
-            return
-        try:
-            subprocess.run(
-                ["pactl", "suspend-sink", sink, "0"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=2,
-            )
-        except Exception:
-            pass
 
-    def _play_cue(
-        self,
-        audio: np.ndarray,
-        *,
-        pre_sec: float,
-        post_sec: float,
-        label: str,
-        min_gain: float = 0.55,
-    ) -> None:
-        try:
-            # Prefer the Bluetooth speaker when the card is up — mailbox/HDMI
-            # often becomes default after a BT drop and the ding is inaudible.
-            self._ensure_bt_playback_sink()
-            rate = SAMPLE_RATE
-            # Tiny pad only — A2DP prime lives inside _play_chime_array (non-zero).
-            primed = np.concatenate(
-                [
-                    np.zeros(max(0, int(rate * pre_sec)), dtype=np.float32),
-                    audio,
-                    np.zeros(max(0, int(rate * post_sec)), dtype=np.float32),
-                ]
-            )
-            with self._cue_lock:
-                self._play_chime_array(
-                    primed,
-                    drain_sec=0.08,
-                    audio_buffer=0.18,
-                    min_gain=min_gain,
-                    label=label,
-                )
-        except Exception:
-            logger.warning("%s playback failed", label, exc_info=True)
 
-    def _ensure_bt_playback_sink(self) -> None:
-        """Point Pulse default sink at A2DP when the BT card is connected."""
-        if not shutil.which("pactl"):
-            return
-        mac = (os.getenv("BT_DEVICE_MAC") or os.getenv("BT_MAC") or "").strip()
-        if not mac or self._bt_profile() != "a2dp_sink":
-            return
-        mac_us = mac.upper().replace(":", "_").replace("-", "_")
-        want = f"bluez_sink.{mac_us}.a2dp_sink"
-        try:
-            current = self._pulse_default_sink()
-            if current == want:
-                return
-            sinks = subprocess.check_output(
-                ["pactl", "list", "short", "sinks"],
-                text=True,
-                timeout=2,
-                stderr=subprocess.DEVNULL,
-            )
-            if want not in sinks:
-                return
-            subprocess.run(
-                ["pactl", "set-default-sink", want],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=2,
-            )
-            logger.info("Cue sink → %s (was %s)", want, current or "?")
-        except Exception:
-            logger.debug("BT sink restore for cue failed", exc_info=True)
 
-    def _play_listen_cue(self) -> None:
-        # Longer / louder two-tone so A2DP has something left after the prime.
-        self._play_cue(
-            self._make_chime(
-                SAMPLE_RATE, 880.0, 0.16, 1174.0, 0.22, amplitude=0.42, harm=0.12
-            ),
-            pre_sec=0.0,
-            post_sec=0.05,
-            label="Listen cue",
-            min_gain=0.75,
-        )
-
-    def _play_sent_cue(self) -> None:
-        self._play_cue(
-            self._make_chime(
-                SAMPLE_RATE, 988.0, 0.10, 740.0, 0.16, amplitude=0.34, harm=0.10
-            ),
-            pre_sec=0.0,
-            post_sec=0.04,
-            label="Sent cue",
-            min_gain=0.65,
-        )
-
-    @staticmethod
-    def _tone(
-        rate: int,
-        freq: float,
-        duration: float,
-        amplitude: float = 0.22,
-        attack: float = 0.02,
-        release: float = 0.08,
-        harm: float = 0.18,
-    ) -> np.ndarray:
-        n = max(1, int(rate * duration))
-        t = np.arange(n, dtype=np.float32) / float(rate)
-        att = min(n, int(rate * attack))
-        rel = min(n, int(rate * release))
-        env = np.ones(n, dtype=np.float32)
-        if att > 0:
-            env[:att] = np.linspace(0.0, 1.0, att, dtype=np.float32)
-        if rel > 0:
-            env[-rel:] = np.linspace(1.0, 0.0, rel, dtype=np.float32)
-        wave = np.sin(2.0 * np.pi * freq * t) * env * amplitude
-        wave += np.sin(4.0 * np.pi * freq * t) * env * (amplitude * harm)
-        return wave.astype(np.float32)
-
-    @classmethod
-    def _make_chime(
-        cls,
-        rate: int,
-        f1: float,
-        d1: float,
-        f2: float,
-        d2: float,
-        *,
-        amplitude: float = 0.22,
-        harm: float = 0.18,
-    ) -> np.ndarray:
-        gap = np.zeros(int(rate * 0.04), dtype=np.float32)
-        chime = np.concatenate(
-            [
-                cls._tone(rate, f1, d1, amplitude=amplitude, harm=harm),
-                gap,
-                cls._tone(rate, f2, d2, amplitude=amplitude, harm=harm),
-            ]
-        )
-        peak = float(np.max(np.abs(chime)) or 1.0)
-        if peak > 0.35:
-            chime *= 0.35 / peak
-        return chime
-
-    def _start_music_poller(self) -> None:
-        thread = threading.Thread(
-            target=self._music_poll_loop,
-            name="music-poller",
-            daemon=True,
-        )
-        thread.start()
-        logger.info(
-            "Music poller enabled (interval=%.1fs, mpv=%s)",
-            self.music_poll_interval,
-            self.mpv_command,
-        )
-
-    def _music_poll_loop(self) -> None:
-        url = f"{self.backend_url}/v1/music/pending/{self.device_id}"
-        while not self._music_stop.is_set():
-            if not self.music_poll:
-                self._music_stop.wait(self.music_poll_interval)
-                continue
-            try:
-                response = self._http.get(url, timeout=30.0)
-                if response.status_code < 400:
-                    payload = response.json()
-                    for command in payload.get("commands") or []:
-                        if isinstance(command, dict):
-                            self._handle_playback(command)
-            except Exception as exc:
-                logger.debug("Music poll failed: %s", exc)
-            self._music_stop.wait(self.music_poll_interval)
-
-    def _sync_volume_from_backend(self) -> None:
-        """Pull last known volume from server; fall back to local default."""
-        url = f"{self.backend_url}/v1/music/status/{self.device_id}"
-        try:
-            response = self._http.get(url, timeout=10.0)
-            if response.status_code < 400:
-                payload = response.json() or {}
-                level = int(payload.get("volume") or self._volume_level)
-                self._set_volume(level)
-                return
-        except Exception as exc:
-            logger.debug("Volume sync failed: %s", exc)
-        self._apply_pulse_volume(self._volume_to_percent(self._volume_level))
-
-    def _handle_playback(self, command: dict) -> None:
-        action = str(command.get("action") or "").strip().lower()
-        stream_url = str(command.get("url") or "").strip()
-        if action in ("timer", "alarm", "cancel_alert", "cancel_timer", "cancel_alarm") or stream_url.startswith(
-            "pi-alert://"
-        ):
-            self._handle_alert_command(command)
-            return
-        if action == "play":
-            title = str(command.get("title") or "").strip()
-            artist = str(command.get("artist") or "").strip()
-            track_id = str(command.get("track_id") or "").strip()
-            source = str(command.get("source") or "").strip()
-            if not stream_url:
-                logger.error("Playback command missing stream URL")
-                return
-            label = f"{artist} — {title}".strip(" —") or title or stream_url
-            logger.info("Playing music: %s", label)
-            self._start_music(stream_url, track_id=track_id, source=source)
-            return
-        if action == "pause":
-            self._pause_music()
-            return
-        if action == "stop":
-            self._stop_music()
-            return
-        if action == "volume":
-            try:
-                level = int(command.get("volume") or 0)
-            except (TypeError, ValueError):
-                level = 0
-            if level:
-                self._set_volume(level)
-
-    @staticmethod
-    def _volume_to_percent(level: int) -> int:
-        level = max(1, min(10, int(level)))
-        return level * 10
-
-    def _assistant_gain(self) -> float:
-        """Linear gain for TTS / any sounddevice playback. 1→0.1 … 10→1.0."""
-        return self._volume_to_percent(self._volume_level) / 100.0
-
-    def _is_music_playing(self) -> bool:
-        with self._music_lock:
-            proc = self._music_proc
-            return proc is not None and proc.poll() is None
-
-    def _duck_music(self, factor: float) -> None:
-        """Lower mpv only (not Pulse) so mic headroom returns while we listen."""
-        if not self._is_music_playing():
-            return
-        base = self._volume_to_percent(self._volume_level)
-        percent = max(5, min(100, int(round(base * max(0.05, factor)))))
-        self._apply_mpv_volume(percent)
-
-    def _restore_music_volume(self) -> None:
-        if not self._is_music_playing():
-            return
-        self._apply_mpv_volume(self._volume_to_percent(self._volume_level))
-
-    def _set_volume(self, level: int) -> None:
-        """Master volume for the whole assistant: TTS + music + Pulse sink."""
-        level = max(1, min(10, int(level)))
-        self._volume_level = level
-        percent = self._volume_to_percent(level)
-        logger.info("Assistant volume %s/10 (%s%%)", level, percent)
-        # Keep listen-duck while waiting for wake; otherwise a volume command
-        # would blast music back to full and bury the mic again.
-        if self._in_wake_listen and self._is_music_playing():
-            self._apply_mpv_volume(max(5, int(round(percent * MUSIC_LISTEN_DUCK))))
-        else:
-            self._apply_mpv_volume(percent)
-        self._apply_pulse_volume(percent)
-
-    def _apply_mpv_volume(self, percent: int) -> None:
-        sock = self._mpv_ipc_path
-        if not sock.exists():
-            return
-        try:
-            import socket
-
-            payload = json.dumps(
-                {"command": ["set_property", "volume", float(percent)]}
-            ).encode("utf-8") + b"\n"
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-                client.settimeout(1.5)
-                client.connect(str(sock))
-                client.sendall(payload)
-                client.recv(4096)
-        except Exception as exc:
-            logger.debug("mpv volume IPC failed: %s", exc)
-
-    def _apply_pulse_volume(self, percent: int) -> None:
-        # Affects Bluetooth/USB sink used for TTS + music host audio.
-        try:
-            subprocess.run(
-                [
-                    "pactl",
-                    "set-sink-volume",
-                    "@DEFAULT_SINK@",
-                    f"{int(percent)}%",
-                ],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=3,
-            )
-        except FileNotFoundError:
-            logger.debug("pactl not found — skipping system volume")
-        except Exception as exc:
-            logger.debug("pactl volume failed: %s", exc)
-
-    def _start_alert_scheduler(self) -> None:
-        thread = threading.Thread(
-            target=self._alert_scheduler_loop,
-            name="alert-scheduler",
-            daemon=True,
-        )
-        thread.start()
-        logger.info("Alert scheduler enabled (timer/alarm)")
-
-    def _handle_alert_command(self, command: dict) -> None:
-        parsed = dict(command)
-        url = str(parsed.get("url") or "").strip()
-        if url.startswith("pi-alert://"):
-            parsed.update(self._parse_alert_url(url))
-        kind = str(parsed.get("kind") or parsed.get("action") or "").strip().lower()
-        if kind in ("cancel", "cancel_alert", "cancel_timer", "cancel_alarm"):
-            target = str(parsed.get("cancel_kind") or parsed.get("target") or "").strip().lower()
-            if kind == "cancel_timer":
-                target = "timer"
-            elif kind == "cancel_alarm":
-                target = "alarm"
-            self._cancel_alerts(kind=target or None)
-            return
-        fire_at = parsed.get("fire_at")
-        delay_sec = parsed.get("delay_sec")
-        try:
-            if fire_at is not None and str(fire_at).strip() != "":
-                when = float(fire_at)
-            elif delay_sec is not None and str(delay_sec).strip() != "":
-                when = time.time() + max(0.0, float(delay_sec))
-            else:
-                when = time.time()
-        except (TypeError, ValueError):
-            logger.error("Alert command missing fire_at/delay_sec: %s", parsed)
-            return
-        job = {
-            "id": str(parsed.get("id") or uuid.uuid4())[:12],
-            "kind": "alarm" if kind == "alarm" else "timer",
-            "fire_at": when,
-            "sound": str(parsed.get("sound") or "classic").strip() or "classic",
-            "media_url": str(parsed.get("media_url") or parsed.get("sound_url") or "").strip(),
-            "label": str(parsed.get("title") or parsed.get("label") or "").strip(),
-            "loop": str(parsed.get("loop") or ("1" if kind == "alarm" else "0")).strip()
-            not in ("0", "false", "no"),
-        }
-        wait = max(0.0, when - time.time())
-        logger.info(
-            "Scheduled %s in %.0fs sound=%s loop=%s",
-            job["kind"],
-            wait,
-            job["sound"],
-            job["loop"],
-        )
-        with self._alert_cv:
-            self._alerts.append(job)
-            self._alert_cv.notify_all()
-
-    @staticmethod
-    def _parse_alert_url(url: str) -> dict:
-        parsed = urlparse(url)
-        kind = (parsed.netloc or parsed.path.lstrip("/")).strip().lower()
-        q = {k: unquote(v[-1]) for k, v in parse_qs(parsed.query).items() if v}
-        out = {"kind": kind, **q}
-        if "url" in q and "media_url" not in out:
-            out["media_url"] = q["url"]
-        return out
-
-    def _cancel_alerts(self, *, kind: str | None = None) -> None:
-        with self._alert_cv:
-            before = len(self._alerts)
-            if kind:
-                self._alerts = [j for j in self._alerts if j.get("kind") != kind]
-            else:
-                self._alerts.clear()
-            removed = before - len(self._alerts)
-            self._alert_cv.notify_all()
-        if kind in (None, "alarm", "timer"):
-            with self._music_lock:
-                if self._current_source == "alert":
-                    self._terminate_music_proc()
-                    self._current_source = ""
-        logger.info("Cancelled alerts kind=%s removed=%d", kind or "all", removed)
-
-    def _alert_scheduler_loop(self) -> None:
-        while not self._alert_stop.is_set():
-            with self._alert_cv:
-                if not self._alerts:
-                    self._alert_cv.wait(timeout=1.0)
-                    continue
-                self._alerts.sort(key=lambda job: float(job.get("fire_at") or 0.0))
-                nxt = self._alerts[0]
-                delay = float(nxt["fire_at"]) - time.time()
-                if delay > 0:
-                    self._alert_cv.wait(timeout=min(delay, 1.0))
-                    continue
-                self._alerts.pop(0)
-            try:
-                self._fire_alert(nxt)
-            except Exception:
-                logger.exception("Alert playback failed")
-
-    def _fire_alert(self, job: dict) -> None:
-        label = job.get("label") or job.get("kind")
-        logger.info("Firing %s (%s)", job.get("kind"), label)
-        media = str(job.get("media_url") or "").strip()
-        cleanup: Path | None = None
-        if not media:
-            cleanup = self._write_builtin_alert(
-                str(job.get("kind") or "timer"),
-                str(job.get("sound") or "classic"),
-            )
-            media = str(cleanup)
-        elif media.startswith(("http://", "https://")):
-            downloaded = self._download_alert_media(media)
-            if downloaded is not None:
-                cleanup = downloaded
-                media = str(downloaded)
-            else:
-                logger.warning(
-                    "Alert URL failed, falling back to builtin sound: %s",
-                    media[:120],
-                )
-                cleanup = self._write_builtin_alert(
-                    str(job.get("kind") or "timer"),
-                    str(job.get("sound") or "classic"),
-                )
-                media = str(cleanup)
-        loop_file = "inf" if job.get("loop") else "no"
-        logger.info("Alert media=%s loop=%s", media[:100], loop_file)
-        self._start_music(
-            media,
-            source="alert",
-            loop_file=loop_file,
-            cleanup_path=cleanup,
-        )
-
-    def _download_alert_media(self, url: str) -> Path | None:
-        """Fetch remote alert audio to a temp file so mpv plays the full clip."""
-        try:
-            response = self._http.get(url, timeout=45.0, follow_redirects=True)
-            response.raise_for_status()
-            data = response.content
-            if len(data) < 256:
-                logger.error("Alert media too small (%d bytes): %s", len(data), url[:120])
-                return None
-            suffix = Path(urlparse(url).path).suffix.lower()
-            if suffix not in (".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".opus"):
-                ctype = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
-                suffix = {
-                    "audio/mpeg": ".mp3",
-                    "audio/mp3": ".mp3",
-                    "audio/wav": ".wav",
-                    "audio/x-wav": ".wav",
-                    "audio/ogg": ".ogg",
-                    "audio/flac": ".flac",
-                    "audio/mp4": ".m4a",
-                    "audio/aac": ".aac",
-                }.get(ctype, ".mp3")
-            fd, name = tempfile.mkstemp(prefix="alert-", suffix=suffix)
-            try:
-                os.write(fd, data)
-            finally:
-                os.close(fd)
-            path = Path(name)
-            logger.info("Alert media downloaded %d bytes → %s", len(data), path.name)
-            return path
-        except Exception:
-            logger.exception("Alert media download failed: %s", url[:120])
-            return None
-
-    def _write_builtin_alert(self, kind: str, sound: str) -> Path:
-        rate = 16000
-        sound_key = (sound or "").strip().lower()
-        # Melodies by sound name; kind no longer forces the short timer beep.
-        if sound_key == "digital":
-            audio = self._synth_alarm_digital(rate)
-        elif sound_key == "soft":
-            audio = self._synth_alarm_soft(rate)
-        elif sound_key == "timer":
-            audio = self._synth_timer_tone(rate)
-        else:
-            audio = self._synth_alarm_classic(rate)
-        fd, name = tempfile.mkstemp(prefix=f"{kind}-", suffix=".wav")
-        os.close(fd)
-        path = Path(name)
-        self._write_wav_pcm(path, audio, rate)
-        return path
-
-    @classmethod
-    def _synth_timer_tone(cls, rate: int) -> np.ndarray:
-        gap = np.zeros(int(rate * 0.12), dtype=np.float32)
-        burst = np.concatenate(
-            [
-                cls._tone(rate, 880.0, 0.12, amplitude=0.28),
-                gap,
-                cls._tone(rate, 1320.0, 0.18, amplitude=0.30),
-                np.zeros(int(rate * 0.35), dtype=np.float32),
-            ]
-        )
-        return np.tile(burst, 2)
-
-    @classmethod
-    def _synth_alarm_classic(cls, rate: int) -> np.ndarray:
-        hi = cls._tone(rate, 880.0, 0.35, amplitude=0.32, harm=0.08)
-        lo = cls._tone(rate, 698.5, 0.35, amplitude=0.32, harm=0.08)
-        pause = np.zeros(int(rate * 0.12), dtype=np.float32)
-        return np.concatenate([hi, pause, lo, pause, hi, pause, lo, np.zeros(int(rate * 0.25), dtype=np.float32)])
-
-    @classmethod
-    def _synth_alarm_digital(cls, rate: int) -> np.ndarray:
-        pieces: list[np.ndarray] = []
-        for freq in (1200.0, 1500.0, 1200.0, 1500.0):
-            pieces.append(cls._tone(rate, freq, 0.08, amplitude=0.28, attack=0.005, release=0.02, harm=0.02))
-            pieces.append(np.zeros(int(rate * 0.06), dtype=np.float32))
-        pieces.append(np.zeros(int(rate * 0.2), dtype=np.float32))
-        return np.concatenate(pieces)
-
-    @classmethod
-    def _synth_alarm_soft(cls, rate: int) -> np.ndarray:
-        return np.concatenate(
-            [
-                cls._tone(rate, 523.25, 0.22, amplitude=0.22),
-                np.zeros(int(rate * 0.08), dtype=np.float32),
-                cls._tone(rate, 659.25, 0.28, amplitude=0.24),
-                np.zeros(int(rate * 0.35), dtype=np.float32),
-            ]
-        )
-
-    def _start_music(
-        self,
-        stream_url: str,
-        *,
-        track_id: str = "",
-        source: str = "",
-        loop_file: str = "no",
-        cleanup_path: Path | None = None,
-    ) -> None:
-        with self._music_lock:
-            self._terminate_music_proc()
-            self._current_track_id = track_id
-            self._current_source = source
-            percent = self._volume_to_percent(self._volume_level)
-            ipc = str(self._mpv_ipc_path)
-            try:
-                self._mpv_ipc_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            try:
-                # Start already ducked if we are in wake-listen — full blast would
-                # bury the mic until the next gate sync tick.
-                start_vol = percent
-                if source == "alert":
-                    start_vol = max(percent, 70)
-                elif self._in_wake_listen:
-                    start_vol = max(5, int(round(percent * MUSIC_LISTEN_DUCK)))
-                self._music_proc = subprocess.Popen(
-                    [
-                        self.mpv_command,
-                        "--no-video",
-                        "--really-quiet",
-                        f"--volume={start_vol}",
-                        f"--loop-file={loop_file}",
-                        f"--input-ipc-server={ipc}",
-                        stream_url,
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except FileNotFoundError:
-                logger.error(
-                    "mpv not found (%s). Install: sudo apt install mpv",
-                    self.mpv_command,
-                )
-                self._music_proc = None
-                self._unlink_quiet(cleanup_path)
-            except Exception:
-                logger.exception("Failed to start mpv")
-                self._music_proc = None
-                self._unlink_quiet(cleanup_path)
-            else:
-                threading.Thread(
-                    target=self._watch_music_proc,
-                    kwargs={"cleanup_path": cleanup_path},
-                    name="music-watch",
-                    daemon=True,
-                ).start()
-
-    def _watch_music_proc(self, cleanup_path: Path | None = None) -> None:
-        proc = self._music_proc
-        if proc is None:
-            self._unlink_quiet(cleanup_path)
-            return
-        code = proc.wait()
-        with self._music_lock:
-            if self._music_proc is not proc:
-                self._unlink_quiet(cleanup_path)
-                return  # replaced or stopped
-            self._music_proc = None
-            track_id = self._current_track_id
-            source = self._current_source
-            self._current_track_id = ""
-            self._current_source = ""
-        self._unlink_quiet(cleanup_path)
-        if code != 0:
-            return
-        if source == "alert":
-            return
-        # Natural end — ask server for next Моя волна track if active.
-        if source == "yandex-wave" or track_id:
-            self._report_track_finished(track_id)
-
-    @staticmethod
-    def _unlink_quiet(path: Path | None) -> None:
-        if path is None:
-            return
-        try:
-            path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    def _report_track_finished(self, track_id: str) -> None:
-        url = f"{self.backend_url}/v1/music/status/{self.device_id}"
-        try:
-            self._http.post(
-                url,
-                json={
-                    "device_id": self.device_id,
-                    "playing": False,
-                    "action": "track_finished",
-                    "title": "",
-                    "artist": "",
-                },
-                timeout=20.0,
-            )
-            logger.info("Reported track_finished (track_id=%s)", track_id or "-")
-        except Exception as exc:
-            logger.debug("track_finished report failed: %s", exc)
-
-    def _pause_music(self) -> None:
-        with self._music_lock:
-            if self._music_proc and self._music_proc.poll() is None:
-                self._music_proc.send_signal(signal.SIGSTOP)
-
-    def _stop_music(self) -> None:
-        had_proc = False
-        with self._music_lock:
-            had_proc = self._music_proc is not None
-            self._current_track_id = ""
-            self._current_source = ""
-            self._terminate_music_proc()
-        # mpv on HFP often wedges the SCO mic — same as after TTS.
-        if had_proc and (os.getenv("BT_DEVICE_MAC") or os.getenv("BT_MAC") or "").strip():
-            self._restore_hfp_audio()
-
-    def _terminate_music_proc(self) -> None:
-        proc = self._music_proc
-        self._music_proc = None
-        if proc is None:
-            try:
-                self._mpv_ipc_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return
-        if proc.poll() is not None:
-            try:
-                self._mpv_ipc_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return
-        proc.terminate()
-        try:
-            proc.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        try:
-            self._mpv_ipc_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    def _write_wav_pcm(self, path: Path, data: np.ndarray, rate: int) -> None:
-        """Write float32 mono/stereo [-1,1] as 16-bit PCM WAV."""
-        pcm = np.clip(data, -1.0, 1.0)
-        if pcm.ndim == 1:
-            channels = 1
-            flat = pcm
-        else:
-            channels = int(pcm.shape[1])
-            flat = pcm.reshape(-1)
-        with wave.open(str(path), "wb") as wav:
-            wav.setnchannels(channels)
-            wav.setsampwidth(2)
-            wav.setframerate(rate)
-            wav.writeframes((flat * 32767.0).astype(np.int16).tobytes())
-
-    def _play_wav(self, wav_bytes: bytes, reply_text: str = "") -> np.ndarray | None:
-        """
-        Play TTS reply.
-
-        On Bluetooth HFP, PortAudio duplex (sd.play + InputStream) often deadlocks
-        Pulse — the client then hangs right after «Listening for microWakeWord»
-        during barge-in. Prefer paplay for output and keep sounddevice for mic only.
-        """
-        fd, tmp_name = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-        path = Path(tmp_name)
-        try:
-            with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
-                rate = wav.getframerate()
-                frames = wav.readframes(wav.getnframes())
-                width = wav.getsampwidth()
-                channels = wav.getnchannels()
-            if width != 2:
-                logger.error("Unsupported sample width: %s", width)
-                return None
-            data = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32767.0
-            if channels > 1:
-                data = data.reshape(-1, channels)
-
-            # Master assistant volume (1–10) applies to spoken replies too.
-            data = data * self._assistant_gain()
-            if self.barge_in:
-                # Duck the reply so bleed stays below a normal speaking voice.
-                data = data * BARGE_PLAYBACK_GAIN
-                if self._hfp_duplex():
-                    # Extra duck on HFP so barge-in mic can clear TTS bleed.
-                    data = data * 0.75
-            # Trailing silence — ALSA/Pulse underruns often clip the last syllable.
-            pad_n = int(rate * TTS_END_PAD_SEC)
-            if pad_n > 0:
-                if data.ndim == 1:
-                    data = np.concatenate(
-                        [data, np.zeros(pad_n, dtype=np.float32)]
-                    )
-                else:
-                    data = np.concatenate(
-                        [
-                            data,
-                            np.zeros((pad_n, data.shape[1]), dtype=np.float32),
-                        ]
-                    )
-
-            duration = float(data.shape[0]) / float(rate)
-            self._write_wav_pcm(path, data, rate)
-            logger.info(
-                "Playing reply (%.1fs, barge_in=%s)",
-                duration,
-                "on" if self.barge_in else "off",
-            )
-
-            paplay = shutil.which("paplay")
-            if paplay:
-                return self._play_wav_paplay(
-                    paplay, path, duration, reply_text=reply_text
-                )
-
-            # Fallback: never open mic while PortAudio output is active (HFP hang).
-            if self.barge_in:
-                logger.warning(
-                    "paplay not found — TTS without barge-in (avoids HFP deadlock)"
-                )
-            sd.play(data, rate)
-            sd.wait()
-            return None
-        finally:
-            path.unlink(missing_ok=True)
-
-    def _bt_profile(self) -> str:
-        return (os.getenv("BT_PROFILE") or "handsfree_head_unit").strip().lower()
-
-    def _bluez_sink_active(self) -> bool:
-        if not shutil.which("pactl"):
-            return False
-        try:
-            sink = subprocess.check_output(
-                ["pactl", "get-default-sink"],
-                text=True,
-                timeout=2,
-                stderr=subprocess.DEVNULL,
-            ).strip()
-        except Exception:
-            return False
-        return "bluez" in sink.lower()
-
-    def _host_playback_active(self) -> bool:
-        """True if Pulse already has a sink-input (keepalive, music, TTS, …)."""
-        if not shutil.which("pactl"):
-            return False
-        try:
-            out = subprocess.check_output(
-                ["pactl", "list", "short", "sink-inputs"],
-                text=True,
-                timeout=1.5,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            return False
-        return any(line.strip() for line in out.splitlines())
-
-    def _open_speaker_echo(self) -> bool:
-        """True when a room speaker plays into a separate mic (A2DP + USB)."""
-        if self._bt_profile() == "a2dp_sink":
-            return True
-        source = (os.getenv("PULSE_DEFAULT_SOURCE") or "").strip().lower()
-        return "usb" in source
-
-    def _hfp_duplex(self) -> bool:
-        """Same Bluetooth headset for mic and speaker (weak acoustic echo)."""
-        return self._bt_profile() != "a2dp_sink" and self._bluez_sink_active()
-
-    def _restore_hfp_audio(self) -> None:
-        """
-        Re-assert Bluetooth HFP after TTS.
-
-        paplay / Pulse often leave the SCO link wedged or flip the card away from
-        handsfree_head_unit — mic then stays silent until profile is bounced.
-        """
-        if not shutil.which("pactl"):
-            return
-        mac = (os.getenv("BT_DEVICE_MAC") or os.getenv("BT_MAC") or "").strip()
-        if not mac:
-            return
-        profile = (os.getenv("BT_PROFILE") or "handsfree_head_unit").strip()
-        usb_source = (os.getenv("PULSE_DEFAULT_SOURCE") or "").strip()
-        # USB mic + A2DP speaker: never bounce the card (that drops the speaker)
-        # and never steal default source back to Bluetooth HFP.
-        if profile == "a2dp_sink":
-            if usb_source and shutil.which("pactl"):
-                subprocess.run(
-                    ["pactl", "set-default-source", usb_source],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=3,
-                )
-            return
-        mac_us = mac.upper().replace(":", "_").replace("-", "_")
-        card = f"bluez_card.{mac_us}"
-        try:
-            cards = subprocess.check_output(
-                ["pactl", "list", "cards", "short"],
-                text=True,
-                timeout=3,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            return
-        if card not in cards:
-            return
-        try:
-            # Bounce profile so the HFP capture source comes back alive.
-            subprocess.run(
-                ["pactl", "set-card-profile", card, "off"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=3,
-            )
-            time.sleep(0.35)
-            subprocess.run(
-                ["pactl", "set-card-profile", card, profile],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=3,
-            )
-            time.sleep(0.4)
-            sink = ""
-            source = ""
-            for line in subprocess.check_output(
-                ["pactl", "list", "short", "sinks"],
-                text=True,
-                timeout=3,
-                stderr=subprocess.DEVNULL,
-            ).splitlines():
-                name = line.split()[1] if len(line.split()) > 1 else ""
-                if mac_us in name:
-                    sink = name
-                    break
-            for line in subprocess.check_output(
-                ["pactl", "list", "short", "sources"],
-                text=True,
-                timeout=3,
-                stderr=subprocess.DEVNULL,
-            ).splitlines():
-                parts = line.split()
-                if len(parts) < 2:
-                    continue
-                name = parts[1]
-                if mac_us in name and not name.endswith(".monitor"):
-                    source = name
-                    break
-            if sink:
-                subprocess.run(
-                    ["pactl", "set-default-sink", sink],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=3,
-                )
-            if source:
-                subprocess.run(
-                    ["pactl", "set-default-source", source],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=3,
-                )
-                mic_vol = (os.getenv("BT_MIC_VOLUME") or "200%").strip()
-                if mic_vol:
-                    subprocess.run(
-                        ["pactl", "set-source-volume", source, mic_vol],
-                        check=False,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=3,
-                    )
-            logger.info("Restored BT audio profile %s on %s", profile, card)
-        except Exception:
-            logger.debug("HFP restore failed", exc_info=True)
-
-    def _play_wav_paplay(
-        self,
-        paplay: str,
-        path: Path,
-        duration: float,
-        reply_text: str = "",
-    ) -> np.ndarray | None:
-        """Play via Pulse paplay; listen for barge-in on the mic in parallel."""
-        open_echo = self._open_speaker_echo()
-        hfp = self._hfp_duplex()
-        use_barge = self.barge_in
-        if use_barge:
-            logger.info(
-                "Barge-in armed during TTS (%s, %.1fs)",
-                "open-echo" if open_echo else ("hfp-soft" if hfp else "local"),
-                duration,
-            )
-
-        proc = subprocess.Popen(
-            [paplay, str(path)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        preroll: np.ndarray | None = None
-        try:
-            if use_barge:
-                preroll = self._watch_barge_in(reply_text, duration)
-                if preroll is not None:
-                    logger.info("Barge-in detected — playback stopped")
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=1.5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    return preroll
-            try:
-                proc.wait(timeout=max(2.0, duration + 2.0))
-            except subprocess.TimeoutExpired:
-                logger.warning("paplay still running after %.1fs — killing", duration)
-                proc.kill()
-                try:
-                    proc.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    pass
-            return None
-        finally:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-            # Always re-seat HFP after TTS so wake/mic survive duplex SCO use.
-            if (os.getenv("BT_DEVICE_MAC") or os.getenv("BT_MAC") or "").strip():
-                self._restore_hfp_audio()
 
     def _watch_barge_in(
         self,
@@ -2419,8 +1344,8 @@ class VoiceClient:
         deadline = time.monotonic() + duration + 0.2
         # Accept on the idle energy floor — the echo gate handles bleed separately.
         threshold = self.energy_threshold
-        open_echo = self._open_speaker_echo()
-        hfp = self._hfp_duplex()
+        open_echo = self.bt.open_speaker_echo()
+        hfp = self.bt.hfp_duplex()
         # HFP SCO is poor duplex: TTS bleed is weak/noisy and a strict echo gate
         # often blocks real «Джарвис». Soften only on a headset mic, never when
         # a room speaker dumps the reply back into a USB mic.
@@ -2520,14 +1445,16 @@ class VoiceClient:
 
     def close(self) -> None:
         """Stop background polling and release the shared HTTP client."""
-        self._alert_stop.set()
-        with self._alert_cv:
-            self._alert_cv.notify_all()
-        self._music_stop.set()
+        self.alerts.stop()
+        self.music.stop()
         try:
             self._http.close()
         except Exception:
             pass
+
+
+# Facade name for composed services (VoiceClient wires bt/playback/music/alerts).
+PiAssistant = VoiceClient
 
 
 def _env_wake_threshold() -> float:

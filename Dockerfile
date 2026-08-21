@@ -73,7 +73,7 @@ RUN ldconfig
 
 WORKDIR /app
 COPY asound.conf /etc/asound.conf
-COPY pi_assistant.py .
+COPY pi_assistant.py bt_audio.py playback_engine.py music_poller.py alert_scheduler.py .
 COPY models ./models
 RUN chown -R pi:pi /home/pi /app
 
