@@ -55,7 +55,7 @@ docker compose down
 
 ## Автообновление
 
-`install.sh` включает systemd timer (~каждые 10 минут):
+`install.sh` включает systemd timer (~каждые 30 секунд, `OnCalendar=*-*-* *:*:00/30`):
 
 ```bash
 scripts/update.sh   # git fetch/pull + compose rebuild при изменениях

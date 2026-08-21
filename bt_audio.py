@@ -13,6 +13,14 @@ logger = logging.getLogger("pi-client")
 class BtAudio:
     """BT profile detection, HFP restore, and Pulse default-sink helpers."""
 
+    def __init__(self) -> None:
+        self._which_cache: dict[str, str | None] = {}
+
+    def _which(self, cmd: str) -> str | None:
+        if cmd not in self._which_cache:
+            self._which_cache[cmd] = shutil.which(cmd)
+        return self._which_cache[cmd]
+
     def pulse_default_sink(self) -> str:
         try:
             return subprocess.check_output(
@@ -25,7 +33,7 @@ class BtAudio:
             return ""
 
     def pulse_unsuspend_sink(self, sink: str) -> None:
-        if not sink or not shutil.which("pactl"):
+        if not sink or not self._which("pactl"):
             return
         try:
             subprocess.run(
@@ -40,7 +48,7 @@ class BtAudio:
 
     def ensure_bt_playback_sink(self) -> None:
         """Point Pulse default sink at A2DP when the BT card is connected."""
-        if not shutil.which("pactl"):
+        if not self._which("pactl"):
             return
         mac = (os.getenv("BT_DEVICE_MAC") or os.getenv("BT_MAC") or "").strip()
         if not mac or self.bt_profile() != "a2dp_sink":
@@ -74,7 +82,7 @@ class BtAudio:
         return (os.getenv("BT_PROFILE") or "handsfree_head_unit").strip().lower()
 
     def bluez_sink_active(self) -> bool:
-        if not shutil.which("pactl"):
+        if not self._which("pactl"):
             return False
         try:
             sink = subprocess.check_output(
@@ -89,7 +97,7 @@ class BtAudio:
 
     def host_playback_active(self) -> bool:
         """True if Pulse already has a sink-input (keepalive, music, TTS, …)."""
-        if not shutil.which("pactl"):
+        if not self._which("pactl"):
             return False
         try:
             out = subprocess.check_output(
@@ -120,7 +128,7 @@ class BtAudio:
         paplay / Pulse often leave the SCO link wedged or flip the card away from
         handsfree_head_unit — mic then stays silent until profile is bounced.
         """
-        if not shutil.which("pactl"):
+        if not self._which("pactl"):
             return
         mac = (os.getenv("BT_DEVICE_MAC") or os.getenv("BT_MAC") or "").strip()
         if not mac:
@@ -130,7 +138,7 @@ class BtAudio:
         # USB mic + A2DP speaker: never bounce the card (that drops the speaker)
         # and never steal default source back to Bluetooth HFP.
         if profile == "a2dp_sink":
-            if usb_source and shutil.which("pactl"):
+            if usb_source and self._which("pactl"):
                 subprocess.run(
                     ["pactl", "set-default-source", usb_source],
                     check=False,

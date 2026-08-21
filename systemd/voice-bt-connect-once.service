@@ -1,3 +1,4 @@
+# Optional one-shot (not installed by install.sh). Same paths as voice-bt-connect.
 [Unit]
 Description=One-shot Bluetooth speaker connect for voice-client-pi
 After=bluetooth.target sound.target
@@ -5,7 +6,7 @@ Wants=bluetooth.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=%h/Client-AI
-Environment=ENV_FILE=%h/Client-AI/.env
+WorkingDirectory=%h/voice-client-pi
+Environment=ENV_FILE=%h/voice-client-pi/.env
 Environment=BT_CONNECT_ONCE=true
-ExecStart=%h/Client-AI/scripts/bt-connect.sh
+ExecStart=%h/voice-client-pi/scripts/bt-connect.sh

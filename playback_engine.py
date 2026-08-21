@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
 import threading
@@ -23,6 +24,12 @@ from bt_audio import BtAudio
 logger = logging.getLogger("pi-client")
 
 SAMPLE_RATE = 16000
+#
+# Volume layers (do not mix):
+# - `_volume_level` (1–10): user-facing assistant/music volume → Pulse % + mpv.
+# - MUSIC_LISTEN_DUCK: fraction of that level while idle-listen (mpv IPC).
+# - BARGE_PLAYBACK_GAIN: softens TTS PCM while barge-in listens.
+# - BT_KEEPALIVE_VOL: host scripts/bt-connect.sh paplay blip (not used here).
 BARGE_PLAYBACK_GAIN = 0.62
 TTS_END_PAD_SEC = 0.35
 MUSIC_LISTEN_DUCK = 0.35
@@ -57,6 +64,14 @@ class PlaybackEngine:
         self._volume_level = 7  # 1..10
         self._mpv_ipc_path = Path(tempfile.gettempdir()) / ("voice-mpv-%s.sock" % os.getpid())
         self.in_wake_listen = False
+        self._which_cache: dict[str, str | None] = {}
+        self._playback_env = os.environ.copy()
+        self._playback_env.setdefault("PULSE_LATENCY_MSEC", "60")
+
+    def _which(self, cmd: str) -> str | None:
+        if cmd not in self._which_cache:
+            self._which_cache[cmd] = shutil.which(cmd)
+        return self._which_cache[cmd]
 
     @property
     def current_source(self) -> str:
@@ -93,12 +108,11 @@ class PlaybackEngine:
         path = Path(tmp_name)
         try:
             self.write_wav_pcm(path, audio, SAMPLE_RATE)
-            env = os.environ.copy()
-            env.setdefault("PULSE_LATENCY_MSEC", "60")
+            env = self._playback_env
             sink = self.bt.pulse_default_sink()
             self.bt.pulse_unsuspend_sink(sink)
             timeout = max(8.0, duration + drain_sec + 3.0)
-            paplay = shutil.which("paplay")
+            paplay = self._which("paplay")
             backend = "none"
             rc = -1
             # Louder than assistant TTS volume so ding is obvious at 4/10.
@@ -123,7 +137,7 @@ class PlaybackEngine:
                     err = (result.stderr or "").strip()[:200]
                     logger.warning("paplay chime failed rc=%s %s", rc, err)
             if backend == "none" or rc != 0:
-                mpv = (self.mpv_command or "").strip() or shutil.which("mpv")
+                mpv = (self.mpv_command or "").strip() or self._which("mpv")
                 if mpv:
                     buf = max(0.15, float(audio_buffer))
                     cmd = [
@@ -319,8 +333,6 @@ class PlaybackEngine:
         if not sock.exists():
             return
         try:
-            import socket
-
             payload = json.dumps(
                 {"command": ["set_property", "volume", float(percent)]}
             ).encode("utf-8") + b"\n"
@@ -573,7 +585,7 @@ class PlaybackEngine:
                 "on" if self.barge_in else "off",
             )
 
-            paplay = shutil.which("paplay")
+            paplay = self._which("paplay")
             if paplay:
                 return self.play_wav_paplay(
                     paplay, path, duration, reply_text=reply_text
