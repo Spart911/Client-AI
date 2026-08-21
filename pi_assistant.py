@@ -1828,7 +1828,8 @@ class VoiceClient:
                 str(job.get("sound") or "classic"),
             )
             media = str(tmp)
-        loop_file = "inf" if job.get("loop") else "2"
+        # Alarms loop forever; timers play the melody exactly once.
+        loop_file = "inf" if job.get("loop") else "no"
         logger.info(
             "Alert media=%s loop=%s",
             "builtin" if tmp is not None else media[:80],
