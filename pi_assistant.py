@@ -19,6 +19,7 @@ import queue
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -56,6 +57,13 @@ BARGE_FLOOR_FRAMES = 24
 BARGE_ARM_SEC = 0.50
 # Soften the reply while we listen for an interrupt — leaves headroom for the
 # mic at any system volume (bleed scales with the speakers, the user's voice does not).
+#
+# Volume layers (do not mix):
+# - `_volume_level` (1–10): user-facing assistant/music volume → Pulse % + mpv.
+# - MUSIC_LISTEN_DUCK / MUSIC_SPEECH_DUCK: fractions of that level while idle-listen
+#   / speech-over-music (mpv IPC only).
+# - BARGE_PLAYBACK_GAIN: softens TTS PCM while barge-in listens.
+# - BT_KEEPALIVE_VOL: host scripts/bt-connect.sh paplay blip (not used in this file).
 BARGE_PLAYBACK_GAIN = 0.62
 # Keep feeding the wake model this long after a burst dips under the gate.
 BARGE_HANGOVER_FRAMES = 4
@@ -300,7 +308,8 @@ class VoiceClient:
         self.device_id = (device_id or "default").strip() or "default"
         self.music_poll = music_poll
         self.music_poll_interval = max(0.5, music_poll_interval)
-        self.mpv_command = (mpv_command or "").strip() or shutil.which("mpv") or "mpv"
+        self._which_cache: dict[str, str | None] = {}
+        self.mpv_command = (mpv_command or "").strip() or self._which("mpv") or "mpv"
         self.audio_device = audio_device
         self.noise_suppress = bool(noise_suppress)
         self._denoise: RnnoiseDenoise | None = None
@@ -361,11 +370,20 @@ class VoiceClient:
         self._volume_level = 7  # 1..10
         self._mpv_ipc_path = Path(tempfile.gettempdir()) / f"voice-mpv-{os.getpid()}.sock"
         self._in_wake_listen = False
+        # Snapshot for paplay/mpv launches; copy only when a call must mutate.
+        self._playback_env = os.environ.copy()
+        self._playback_env.setdefault("PULSE_LATENCY_MSEC", "60")
         # Reuse TCP/TLS across assist + music polls (saves handshake each turn).
         self._http = httpx.Client(
             timeout=httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0),
             limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
         )
+
+    def _which(self, cmd: str) -> str | None:
+        """Cache PATH lookups for tools we spawn often (paplay/mpv/pactl)."""
+        if cmd not in self._which_cache:
+            self._which_cache[cmd] = shutil.which(cmd)
+        return self._which_cache[cmd]
 
     def run(self) -> None:
         logger.info("Backend: %s", self.backend_url)
@@ -526,7 +544,7 @@ class VoiceClient:
 
     def _ensure_usb_pulse(self) -> None:
         """Keep USB mic on Pulse analog-mono (needed after a previous 'off')."""
-        if not shutil.which("pactl"):
+        if not self._which("pactl"):
             return
         try:
             cards = subprocess.check_output(
@@ -1013,7 +1031,14 @@ class VoiceClient:
                         last_score_log = best_score
 
                     if now - last_heartbeat >= 5.0:
-                        logger.info(
+                        # Quiet by default; WAKE_HEARTBEAT=1 restores INFO for debug.
+                        hb_log = (
+                            logger.info
+                            if (os.getenv("WAKE_HEARTBEAT") or "").strip()
+                            in ("1", "true", "yes")
+                            else logger.debug
+                        )
+                        hb_log(
                             "Mic heartbeat: rms=%.5f peak_rms=%.5f mww=%.3f peak_score=%.3f frames=%d%s",
                             frame_energy,
                             peak_energy,
@@ -1351,12 +1376,11 @@ class VoiceClient:
         path = Path(tmp_name)
         try:
             self._write_wav_pcm(path, audio, SAMPLE_RATE)
-            env = os.environ.copy()
-            env.setdefault("PULSE_LATENCY_MSEC", "60")
+            env = self._playback_env
             sink = self._pulse_default_sink()
             self._pulse_unsuspend_sink(sink)
             timeout = max(8.0, duration + drain_sec + 3.0)
-            paplay = shutil.which("paplay")
+            paplay = self._which("paplay")
             backend = "none"
             rc = -1
             # Louder than assistant TTS volume so ding is obvious at 4/10.
@@ -1381,7 +1405,7 @@ class VoiceClient:
                     err = (result.stderr or "").strip()[:200]
                     logger.warning("paplay chime failed rc=%s %s", rc, err)
             if backend == "none" or rc != 0:
-                mpv = (self.mpv_command or "").strip() or shutil.which("mpv")
+                mpv = (self.mpv_command or "").strip() or self._which("mpv")
                 if mpv:
                     buf = max(0.15, float(audio_buffer))
                     cmd = [
@@ -1428,7 +1452,7 @@ class VoiceClient:
             path.unlink(missing_ok=True)
 
     def _pulse_unsuspend_sink(self, sink: str) -> None:
-        if not sink or not shutil.which("pactl"):
+        if not sink or not self._which("pactl"):
             return
         try:
             subprocess.run(
@@ -1476,7 +1500,7 @@ class VoiceClient:
 
     def _ensure_bt_playback_sink(self) -> None:
         """Point Pulse default sink at A2DP when the BT card is connected."""
-        if not shutil.which("pactl"):
+        if not self._which("pactl"):
             return
         mac = (os.getenv("BT_DEVICE_MAC") or os.getenv("BT_MAC") or "").strip()
         if not mac or self._bt_profile() != "a2dp_sink":
@@ -1701,8 +1725,6 @@ class VoiceClient:
         if not sock.exists():
             return
         try:
-            import socket
-
             payload = json.dumps(
                 {"command": ["set_property", "volume", float(percent)]}
             ).encode("utf-8") + b"\n"
@@ -2183,7 +2205,7 @@ class VoiceClient:
                 "on" if self.barge_in else "off",
             )
 
-            paplay = shutil.which("paplay")
+            paplay = self._which("paplay")
             if paplay:
                 return self._play_wav_paplay(
                     paplay, path, duration, reply_text=reply_text
@@ -2204,7 +2226,7 @@ class VoiceClient:
         return (os.getenv("BT_PROFILE") or "handsfree_head_unit").strip().lower()
 
     def _bluez_sink_active(self) -> bool:
-        if not shutil.which("pactl"):
+        if not self._which("pactl"):
             return False
         try:
             sink = subprocess.check_output(
@@ -2219,7 +2241,7 @@ class VoiceClient:
 
     def _host_playback_active(self) -> bool:
         """True if Pulse already has a sink-input (keepalive, music, TTS, …)."""
-        if not shutil.which("pactl"):
+        if not self._which("pactl"):
             return False
         try:
             out = subprocess.check_output(
@@ -2250,7 +2272,7 @@ class VoiceClient:
         paplay / Pulse often leave the SCO link wedged or flip the card away from
         handsfree_head_unit — mic then stays silent until profile is bounced.
         """
-        if not shutil.which("pactl"):
+        if not self._which("pactl"):
             return
         mac = (os.getenv("BT_DEVICE_MAC") or os.getenv("BT_MAC") or "").strip()
         if not mac:
@@ -2260,7 +2282,7 @@ class VoiceClient:
         # USB mic + A2DP speaker: never bounce the card (that drops the speaker)
         # and never steal default source back to Bluetooth HFP.
         if profile == "a2dp_sink":
-            if usb_source and shutil.which("pactl"):
+            if usb_source and self._which("pactl"):
                 subprocess.run(
                     ["pactl", "set-default-source", usb_source],
                     check=False,
