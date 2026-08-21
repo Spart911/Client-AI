@@ -731,17 +731,20 @@ class VoiceClient:
                 speech_latched = False
                 self._mww.reset()
                 self._mww_features.reset()
-                self._duck_music(MUSIC_LISTEN_DUCK)
+                # Keep alerts at full volume — ducking them invites false wakes
+                # (quiet ring + loud bleed scoring) and makes the cue hard to hear.
+                if self._current_source != "alert":
+                    self._duck_music(MUSIC_LISTEN_DUCK)
                 logger.info(
-                    "Music on — duck×%.2f + %s",
-                    MUSIC_LISTEN_DUCK,
+                    "Music on — %s",
                     (
-                        "alert (Jarvis can dismiss)"
+                        "alert (Jarvis only above playback gate)"
                         if self._current_source == "alert"
                         else (
-                            "open-echo gate (don't score speaker bleed)"
+                            f"duck×{MUSIC_LISTEN_DUCK:.2f} + open-echo gate "
+                            "(don't score speaker bleed)"
                             if open_echo
-                            else "soft wake scoring over bleed"
+                            else f"duck×{MUSIC_LISTEN_DUCK:.2f} + soft wake scoring"
                         )
                     ),
                 )
@@ -894,11 +897,12 @@ class VoiceClient:
                                 stable = 0
                         if not feeding:
                             pre_burst_f.append(frame_f.copy())
-                            # Alerts must stay dismissible by «Джарвис» even on
-                            # open speakers — otherwise the tone blocks wake.
-                            alert_playing = self._current_source == "alert"
+                            # Open-echo music/alerts: never score speaker bleed as
+                            # wake — that used to stop a 15s timer after ~1s.
+                            # Jarvis still works when speech clears the gate
+                            # (feeding=True). Soft/HFP may score under the gate.
                             score_under_gate = barge_soft or (
-                                music_mode and (not open_echo or alert_playing)
+                                music_mode and not open_echo
                             )
                             if not score_under_gate:
                                 continue
@@ -935,8 +939,7 @@ class VoiceClient:
                             # paplay/keepalive is actually on the sink.
                             stable = 0
                     accept_energy = self.wake_accept_energy
-                    alert_playing = self._current_source == "alert"
-                    if barge_soft or (music_mode and (not open_echo or alert_playing)):
+                    if barge_soft or (music_mode and not open_echo):
                         accept_energy = max(0.003, accept_energy * 0.5)
                     burst_ok, burst_peak, burst_floor = self._wake_burst_ok(
                         recent_energy, accept_energy
@@ -1821,21 +1824,70 @@ class VoiceClient:
         label = job.get("label") or job.get("kind")
         logger.info("Firing %s (%s)", job.get("kind"), label)
         media = str(job.get("media_url") or "").strip()
-        tmp: Path | None = None
+        cleanup: Path | None = None
         if not media:
-            tmp = self._write_builtin_alert(
+            cleanup = self._write_builtin_alert(
                 str(job.get("kind") or "timer"),
                 str(job.get("sound") or "classic"),
             )
-            media = str(tmp)
-        # Alarms loop forever; timers play the melody exactly once.
+            media = str(cleanup)
+        elif media.startswith(("http://", "https://")):
+            downloaded = self._download_alert_media(media)
+            if downloaded is not None:
+                cleanup = downloaded
+                media = str(downloaded)
+            else:
+                logger.warning(
+                    "Alert URL failed, falling back to builtin sound: %s",
+                    media[:120],
+                )
+                cleanup = self._write_builtin_alert(
+                    str(job.get("kind") or "timer"),
+                    str(job.get("sound") or "classic"),
+                )
+                media = str(cleanup)
         loop_file = "inf" if job.get("loop") else "no"
-        logger.info(
-            "Alert media=%s loop=%s",
-            "builtin" if tmp is not None else media[:80],
-            loop_file,
+        logger.info("Alert media=%s loop=%s", media[:100], loop_file)
+        self._start_music(
+            media,
+            source="alert",
+            loop_file=loop_file,
+            cleanup_path=cleanup,
         )
-        self._start_music(media, source="alert", loop_file=loop_file)
+
+    def _download_alert_media(self, url: str) -> Path | None:
+        """Fetch remote alert audio to a temp file so mpv plays the full clip."""
+        try:
+            response = self._http.get(url, timeout=45.0, follow_redirects=True)
+            response.raise_for_status()
+            data = response.content
+            if len(data) < 256:
+                logger.error("Alert media too small (%d bytes): %s", len(data), url[:120])
+                return None
+            suffix = Path(urlparse(url).path).suffix.lower()
+            if suffix not in (".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".opus"):
+                ctype = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+                suffix = {
+                    "audio/mpeg": ".mp3",
+                    "audio/mp3": ".mp3",
+                    "audio/wav": ".wav",
+                    "audio/x-wav": ".wav",
+                    "audio/ogg": ".ogg",
+                    "audio/flac": ".flac",
+                    "audio/mp4": ".m4a",
+                    "audio/aac": ".aac",
+                }.get(ctype, ".mp3")
+            fd, name = tempfile.mkstemp(prefix="alert-", suffix=suffix)
+            try:
+                os.write(fd, data)
+            finally:
+                os.close(fd)
+            path = Path(name)
+            logger.info("Alert media downloaded %d bytes → %s", len(data), path.name)
+            return path
+        except Exception:
+            logger.exception("Alert media download failed: %s", url[:120])
+            return None
 
     def _write_builtin_alert(self, kind: str, sound: str) -> Path:
         rate = 16000
@@ -1902,6 +1954,7 @@ class VoiceClient:
         track_id: str = "",
         source: str = "",
         loop_file: str = "no",
+        cleanup_path: Path | None = None,
     ) -> None:
         with self._music_lock:
             self._terminate_music_proc()
@@ -1940,29 +1993,35 @@ class VoiceClient:
                     self.mpv_command,
                 )
                 self._music_proc = None
+                self._unlink_quiet(cleanup_path)
             except Exception:
                 logger.exception("Failed to start mpv")
                 self._music_proc = None
+                self._unlink_quiet(cleanup_path)
             else:
                 threading.Thread(
                     target=self._watch_music_proc,
+                    kwargs={"cleanup_path": cleanup_path},
                     name="music-watch",
                     daemon=True,
                 ).start()
 
-    def _watch_music_proc(self) -> None:
+    def _watch_music_proc(self, cleanup_path: Path | None = None) -> None:
         proc = self._music_proc
         if proc is None:
+            self._unlink_quiet(cleanup_path)
             return
         code = proc.wait()
         with self._music_lock:
             if self._music_proc is not proc:
+                self._unlink_quiet(cleanup_path)
                 return  # replaced or stopped
             self._music_proc = None
             track_id = self._current_track_id
             source = self._current_source
             self._current_track_id = ""
             self._current_source = ""
+        self._unlink_quiet(cleanup_path)
         if code != 0:
             return
         if source == "alert":
@@ -1970,6 +2029,15 @@ class VoiceClient:
         # Natural end — ask server for next Моя волна track if active.
         if source == "yandex-wave" or track_id:
             self._report_track_finished(track_id)
+
+    @staticmethod
+    def _unlink_quiet(path: Path | None) -> None:
+        if path is None:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def _report_track_finished(self, track_id: str) -> None:
         url = f"{self.backend_url}/v1/music/status/{self.device_id}"
