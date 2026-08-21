@@ -6,9 +6,12 @@
 #   BT_PROFILE=handsfree_head_unit     HFP mic+speaker (default)
 #                                      use a2dp_sink for speaker-only
 #   BT_CONNECT_INTERVAL=15             seconds between reconnect attempts
-#   BT_KEEPALIVE_SEC=120               quiet blip so speaker won't sleep
-#                                      (0 = disable). Speakers often sleep ~10–15 min.
+#   BT_KEEPALIVE_SEC=45                quiet blip so speaker won't sleep
+#                                      (0 = disable). Many A2DP speakers sleep
+#                                      after a few minutes of real silence.
 #                                      Use mid-band tone: HFP filters out ~40 Hz.
+#   BT_KEEPALIVE_VOL=3500              paplay 0..65536; loud enough to keep amp
+#                                      awake, still below room-wake for USB mic.
 #
 # Usage:
 #   BT_DEVICE_MAC=AA:BB:CC:DD:EE:FF bash scripts/bt-connect.sh
@@ -41,10 +44,10 @@ MAC="${BT_DEVICE_MAC:-${BT_MAC:-}}"
 PROFILE="${BT_PROFILE:-handsfree_head_unit}"
 INTERVAL="${BT_CONNECT_INTERVAL:-15}"
 ONCE="${BT_CONNECT_ONCE:-false}"
-# Default: blip every 2 min (HFP-audible tone; 40 Hz was filtered and useless).
-KEEPALIVE_SEC="${BT_KEEPALIVE_SEC:-120}"
-KEEPALIVE_VOL="${BT_KEEPALIVE_VOL:-1200}"  # paplay 0..65536; ~2% — wake-safe
-KEEPALIVE_WAV="${BT_KEEPALIVE_WAV:-/tmp/voice-bt-keepalive-v3.wav}"
+# Default: blip every 45s — A2DP speakers often sleep well before 10–15 min.
+KEEPALIVE_SEC="${BT_KEEPALIVE_SEC:-45}"
+KEEPALIVE_VOL="${BT_KEEPALIVE_VOL:-3500}"  # paplay 0..65536; ~5% — keeps amp awake
+KEEPALIVE_WAV="${BT_KEEPALIVE_WAV:-/tmp/voice-bt-keepalive-v4.wav}"
 _last_keepalive_ts=0
 LOG_FILE="${BT_LOG_FILE:-${SCRIPT_DIR}/logs/bt-connect.log}"
 mkdir -p "$(dirname "${LOG_FILE}")"
@@ -214,7 +217,7 @@ apply_pulse() {
 
 ensure_keepalive_wav() {
   # HFP is ~300–3400 Hz: a 40 Hz tone never reaches the speaker amp.
-  # Soft 900 Hz / ~120 ms — short enough that wake needs ≥4 loud frames to miss it.
+  # Soft 880 Hz / ~200 ms — long enough for A2DP idle detection, short for wake.
   if [[ -f "${KEEPALIVE_WAV}" ]]; then
     return 0
   fi
@@ -222,7 +225,7 @@ ensure_keepalive_wav() {
 import math, struct, sys, wave
 
 path = sys.argv[1]
-rate, dur, freq, amp = 16000, 0.12, 900.0, 500  # amp out of 32767 (~1.5%)
+rate, dur, freq, amp = 16000, 0.20, 880.0, 2800  # amp out of 32767 (~8.5%)
 n = max(1, int(rate * dur))
 with wave.open(path, "w") as w:
     w.setnchannels(1)
@@ -272,22 +275,42 @@ maybe_keepalive() {
     log "failed to build keepalive wav"
     return 0
   }
-  local sink vol
+  local sink vol rc
+  # Prefer the A2DP sink even if Pulse default drifted to HDMI/analog.
   sink="$(pactl get-default-sink 2>/dev/null || true)"
+  if [[ "${PROFILE}" == "a2dp_sink" ]]; then
+    local mac_us want
+    mac_us="$(echo "${mac_norm}" | tr 'a-f' 'A-F' | tr ':' '_')"
+    want="bluez_sink.${mac_us}.a2dp_sink"
+    if pactl list short sinks 2>/dev/null | grep -q "${want}"; then
+      sink="${want}"
+      pactl set-default-sink "${want}" >/dev/null 2>&1 || true
+    fi
+  fi
+  # Suspended bluez sinks swallow paplay with rc=0 and no RF audio.
+  if [[ -n "${sink}" ]]; then
+    pactl suspend-sink "${sink}" 0 >/dev/null 2>&1 || true
+  fi
   vol="${KEEPALIVE_VOL}"
-  # A2DP + USB mic: loud keepalive echoes into the wake mic.
-  if [[ "${PROFILE}" == "a2dp_sink" ]] && [[ "${vol}" =~ ^[0-9]+$ ]] && (( vol > 1500 )); then
-    log "keepalive vol ${vol}→1500 (a2dp wake-safe cap)"
-    vol=1500
+  # A2DP + USB mic: keep blip modest so wake doesn't latch on the tone.
+  if [[ "${PROFILE}" == "a2dp_sink" ]] && [[ "${vol}" =~ ^[0-9]+$ ]] && (( vol > 5000 )); then
+    log "keepalive vol ${vol}→5000 (a2dp wake-safe cap)"
+    vol=5000
   fi
   # paplay --volume: 0..65536
   if [[ -n "${sink}" ]]; then
-    paplay --device="${sink}" --volume="${vol}" "${KEEPALIVE_WAV}" >/dev/null 2>&1 || true
+    paplay --device="${sink}" --volume="${vol}" "${KEEPALIVE_WAV}" >/dev/null 2>&1
+    rc=$?
   else
-    paplay --volume="${vol}" "${KEEPALIVE_WAV}" >/dev/null 2>&1 || true
+    paplay --volume="${vol}" "${KEEPALIVE_WAV}" >/dev/null 2>&1
+    rc=$?
   fi
   _last_keepalive_ts="${now}"
-  log "keepalive blip (vol=${vol})"
+  if [[ "${rc}" -ne 0 ]]; then
+    log "keepalive paplay failed rc=${rc} sink=${sink:-none}"
+  else
+    log "keepalive blip (vol=${vol} sink=${sink:-default})"
+  fi
 }
 
 cycle() {
@@ -312,8 +335,8 @@ cycle() {
 }
 
 log "MAC=${mac_norm} profile=${PROFILE} interval=${INTERVAL}s keepalive=${KEEPALIVE_SEC}s vol=${KEEPALIVE_VOL}"
-# Drop legacy keepalive samples if present.
-rm -f /tmp/voice-bt-keepalive.wav /tmp/voice-bt-keepalive-v2.wav 2>/dev/null || true
+# Drop legacy keepalive samples if present (force rebuild of louder v4 tone).
+rm -f /tmp/voice-bt-keepalive.wav /tmp/voice-bt-keepalive-v2.wav /tmp/voice-bt-keepalive-v3.wav 2>/dev/null || true
 _last_keepalive_ts="$(date +%s)"
 cycle
 
