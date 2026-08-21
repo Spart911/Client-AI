@@ -31,6 +31,12 @@ import numpy as np
 import sounddevice as sd
 
 from alert_scheduler import AlertScheduler
+from audio_dsp import (
+    SAMPLE_RATE,
+    Highpass as _Highpass,
+    echo_gate_energy,
+    resample_int as _resample_int,
+)
 from bt_audio import BtAudio
 from music_poller import MusicPoller
 from playback_engine import (
@@ -46,7 +52,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pi-client")
 
-SAMPLE_RATE = 16000
 CHANNELS = 1
 # 80 ms blocks @ 16 kHz — matches microWakeWord streaming windows.
 FRAME_SAMPLES = 1280
@@ -127,65 +132,6 @@ def _load_librnnoise() -> ctypes.CDLL:
     raise FileNotFoundError(
         last_error or "librnnoise not found (install package librnnoise0)"
     )
-
-
-class _Highpass:
-    """2nd-order Butterworth-ish high-pass (RBJ biquad). No scipy."""
-
-    def __init__(self, rate: int, hz: float) -> None:
-        w0 = 2.0 * math.pi * float(hz) / float(rate)
-        cos_w0 = math.cos(w0)
-        sin_w0 = math.sin(w0)
-        alpha = sin_w0 / (2.0 * math.sqrt(0.5))
-        b0 = (1.0 + cos_w0) * 0.5
-        b1 = -(1.0 + cos_w0)
-        b2 = (1.0 + cos_w0) * 0.5
-        a0 = 1.0 + alpha
-        a1 = -2.0 * cos_w0
-        a2 = 1.0 - alpha
-        self._b0 = b0 / a0
-        self._b1 = b1 / a0
-        self._b2 = b2 / a0
-        self._a1 = a1 / a0
-        self._a2 = a2 / a0
-        self.reset()
-
-    def reset(self) -> None:
-        self._z1 = 0.0
-        self._z2 = 0.0
-
-    def process(self, x: np.ndarray) -> np.ndarray:
-        y = np.empty(x.size, dtype=np.float32)
-        z1, z2 = self._z1, self._z2
-        b0, b1, b2 = self._b0, self._b1, self._b2
-        a1, a2 = self._a1, self._a2
-        for i, sample in enumerate(x):
-            w = float(sample) - a1 * z1 - a2 * z2
-            y[i] = b0 * w + b1 * z1 + b2 * z2
-            z2 = z1
-            z1 = w
-        self._z1, self._z2 = z1, z2
-        return y
-
-
-def _resample_int(x: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
-    """Integer-ratio resample. 16 kHz ↔ 48 kHz is exactly ×3 / ÷3."""
-    x = np.asarray(x, dtype=np.float32)
-    if x.size == 0 or src_rate == dst_rate:
-        return x
-    g = math.gcd(int(src_rate), int(dst_rate))
-    up = int(dst_rate) // g
-    down = int(src_rate) // g
-    if down == 1:
-        n = int(x.size)
-        t_dst = np.linspace(0.0, n - 1, n * up, dtype=np.float64)
-        return np.interp(t_dst, np.arange(n, dtype=np.float64), x).astype(np.float32)
-    if up == 1:
-        n = int(x.size) - (int(x.size) % down)
-        if n <= 0:
-            return np.zeros(0, dtype=np.float32)
-        return x[:n].reshape(-1, down).mean(axis=1).astype(np.float32)
-    return _resample_int(_resample_int(x, src_rate, src_rate * up), src_rate * up, dst_rate)
 
 
 class RnnoiseDenoise:
@@ -1105,13 +1051,15 @@ class VoiceClient:
         a peak×margin gate rises with the speaker volume until a normal voice
         can no longer clear it. Playback is also ducked while we listen.
         """
-        if len(window) < max(3, min_frames):
-            return None
-        ordered = sorted(window)
-        frac = min(0.95, max(0.5, float(percentile)))
-        index = min(len(ordered) - 1, int(len(ordered) * frac))
         factor = self.barge_energy_mult if mult is None else max(BARGE_MULT_MIN, mult)
-        return max(threshold, ordered[index] * factor)
+        return echo_gate_energy(
+            window,
+            threshold,
+            mult=factor,
+            percentile=percentile,
+            min_frames=min_frames,
+            mult_floor=BARGE_MULT_MIN,
+        )
 
     def _assist_and_play(self, wav_bytes: bytes) -> np.ndarray | None:
         """Send audio, play the reply; return barge-in preroll when interrupted."""
