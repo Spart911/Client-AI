@@ -780,6 +780,10 @@ class VoiceClient:
                 stable = 0
             if not music_mode:
                 return
+            # Never duck an alert: relative speech-gate sees the ringtone itself
+            # as "user speech" and was silencing ~15s timers after ~1s.
+            if self._current_source == "alert":
+                return
             if active:
                 self._duck_music(MUSIC_SPEECH_DUCK)
                 speech_ducked = True
@@ -878,7 +882,12 @@ class VoiceClient:
                             floor_window.append(frame_energy)
                         if loud:
                             quiet_frames = 0
-                            if not feeding:
+                            # Open-echo alert: ringtone IS the floor — do not enter
+                            # feeding/MWW on self-bleed (that also used to duck it).
+                            alert_open = (
+                                open_echo and self._current_source == "alert"
+                            )
+                            if not feeding and not alert_open:
                                 set_feeding(True)
                                 for onset in pre_burst_f:
                                     preroll.append(onset)
@@ -890,6 +899,12 @@ class VoiceClient:
                                         frame_energy,
                                     )
                                     gate_logged = True
+                            elif alert_open and not gate_logged:
+                                logger.info(
+                                    "Alert playback bleed rms=%.3f (ignored for barge)",
+                                    frame_energy,
+                                )
+                                gate_logged = True
                         elif feeding:
                             quiet_frames += 1
                             if quiet_frames > BARGE_HANGOVER_FRAMES:
