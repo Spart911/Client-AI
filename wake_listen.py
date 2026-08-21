@@ -17,14 +17,15 @@ from typing import Callable
 import numpy as np
 import sounddevice as sd
 
-from audio_dsp import SAMPLE_RATE, echo_gate_energy
+from audio_dsp import MIC_RATE, SAMPLE_RATE, echo_gate_energy, resample_int
 from playback_engine import MUSIC_LISTEN_DUCK as _PE_MUSIC_LISTEN_DUCK
 
 logger = logging.getLogger("pi-client")
 
 CHANNELS = 1
-# 80 ms blocks @ 16 kHz — matches microWakeWord streaming windows.
-FRAME_SAMPLES = 1280
+# 80 ms capture @ 48 kHz; after ↓16 kHz → FRAME_SAMPLES for microWakeWord.
+MIC_FRAME_SAMPLES = 3840  # int(MIC_RATE * 0.08)
+FRAME_SAMPLES = 1280  # int(SAMPLE_RATE * 0.08)
 
 # --- Barge / wake tuning ---
 # Below this the barge-in gate sits at the speaker bleed level and lets it through.
@@ -136,7 +137,7 @@ class WakeListener:
             stable_needed = max(1, stable_frames)
         score_limit = float(self._mww.probability_cutoff)
 
-        block = FRAME_SAMPLES
+        block = MIC_FRAME_SAMPLES
         q: queue.Queue[np.ndarray] = queue.Queue()
         stable = 0
         use_gate = bool(echo_gate)
@@ -274,7 +275,7 @@ class WakeListener:
                 self._denoise.reset()
             sync_music_duck()
             with sd.InputStream(
-                samplerate=SAMPLE_RATE,
+                samplerate=MIC_RATE,
                 channels=CHANNELS,
                 dtype="int16",
                 blocksize=block,
@@ -297,10 +298,10 @@ class WakeListener:
                         frame_f = frame_f * (0.35 / peak)
                     if self._denoise is not None:
                         frame_f = self._denoise.process(frame_f)
-                        mono = np.clip(frame_f * 32768.0, -32768, 32767).astype(np.int16)
-                    else:
-                        mono = np.clip(frame_f * 32768.0, -32768, 32767).astype(np.int16)
-                    frame_energy = self._rms(frame_f)
+                    # RNNoise stays at 48 kHz; MWW + preroll need 16 kHz.
+                    frame_16 = resample_int(frame_f, MIC_RATE, SAMPLE_RATE)
+                    mono = np.clip(frame_16 * 32768.0, -32768, 32767).astype(np.int16)
+                    frame_energy = self._rms(frame_16)
                     frames_seen += 1
                     peak_energy = max(peak_energy, frame_energy)
                     recent_energy.append(frame_energy)
@@ -375,7 +376,7 @@ class WakeListener:
                                 set_feeding(False)
                                 stable = 0
                         if not feeding:
-                            pre_burst_f.append(frame_f.copy())
+                            pre_burst_f.append(frame_16.copy())
                             # Open-echo music/alerts: never score speaker bleed as
                             # wake — that used to stop a 15s timer after ~1s.
                             # Jarvis still works when speech clears the gate
@@ -385,9 +386,9 @@ class WakeListener:
                             )
                             if not score_under_gate:
                                 continue
-                        preroll.append(frame_f.copy())
+                        preroll.append(frame_16.copy())
                     else:
-                        preroll.append(frame_f.copy())
+                        preroll.append(frame_16.copy())
 
                     if (
                         respect_cooldown
