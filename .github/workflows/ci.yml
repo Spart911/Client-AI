@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          # Full stack when possible; PortAudio / wake packages often fail on runners.
+          if ! pip install -r requirements.txt; then
+            echo "::warning::Full requirements install failed; installing CI-safe subset (no mic/wake)"
+            pip install "httpx>=0.27.0" "numpy>=1.24.0,<2.0.0" "scipy>=1.10.0,<1.12.0"
+          fi
+
+      - name: Syntax check (app modules)
+        run: |
+          set -euo pipefail
+          mods=(
+            pi_assistant.py
+            audio_dsp.py
+            bt_audio.py
+            playback_engine.py
+            music_poller.py
+            alert_scheduler.py
+            wake_listen.py
+          )
+          for f in "${mods[@]}"; do
+            if [ -f "$f" ]; then
+              python -m py_compile "$f"
+              echo "ok $f"
+            else
+              echo "skip missing $f"
+            fi
+          done
+
+      - name: Unit tests
+        run: pytest -q
+
+      - name: Byte-compile tree
+        run: |
+          # Cheap lint substitute; skip heavy/local-only trees (never download models here).
+          python -m compileall -q -x '(^|/)(mww_retrain|record|\.venv|\.venv-oww)(/|$)' .
