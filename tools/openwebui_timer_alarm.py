@@ -1,10 +1,10 @@
 """
 title: Timer & Alarm (Pi living room)
 author: Client-AI
-version: 0.4.3
+version: 0.4.4
 description: >
   Ставит таймер/будильник через pi-alert:// на Raspberry Pi.
-  Таймер по умолчанию — мелодия classic (как будильник), не отдельный timer-писк.
+  Таймер по умолчанию — мелодия classic, крутится до «Джарвис» (как будильник).
   В query уходит pi-alert://… — бэкенд кладёт это в очередь без Яндекса.
   Нужен тот же X-Music-Api-Key, что у «Yandex Music Player».
   ВАЖНО: обнови tool в Open WebUI после правки.
@@ -61,7 +61,8 @@ class Tools:
 
     def set_timer(self, seconds: int = 0, minutes: int = 0, label: str = "") -> str:
         """
-        Поставить таймер. По истечении времени на колонке Pi проиграется сигнал таймера.
+        Поставить таймер. По истечении времени на колонке Pi зациклится сигнал
+        (мелодия classic), пока не скажешь «Джарвис» или cancel_timer.
         :param seconds: Секунды (например 30)
         :param minutes: Минуты, плюсуются к секундам
         :param label: Необязательное название («яйца», «чай»)
@@ -84,14 +85,17 @@ class Tools:
             fire_at=fire_at,
             sound="classic",
             media_url=timer_media,
-            loop=0,
+            loop=1,
             title=title,
         )
         err = self._enqueue(url, title)
         if err:
             return err
         when = datetime.fromtimestamp(fire_at, tz=self._tz()).strftime("%H:%M:%S")
-        return f"Таймер «{title}» на {self._fmt_duration(total)}. Сигнал около {when}."
+        return (
+            f"Таймер «{title}» на {self._fmt_duration(total)}. "
+            f"Сигнал около {when}, крутится до «Джарвис»."
+        )
 
     def set_alarm(self, time_hhmm: str, sound: str = "classic", label: str = "") -> str:
         """
