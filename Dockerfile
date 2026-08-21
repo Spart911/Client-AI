@@ -74,6 +74,7 @@ RUN ldconfig
 WORKDIR /app
 COPY asound.conf /etc/asound.conf
 COPY pi_assistant.py .
+COPY audio_dsp.py .
 COPY models ./models
 RUN chown -R pi:pi /home/pi /app
 
