@@ -32,6 +32,7 @@ import sounddevice as sd
 
 from alert_scheduler import AlertScheduler
 from audio_dsp import (
+    MIC_RATE,
     SAMPLE_RATE,
     Highpass as _Highpass,
     echo_gate_energy,
@@ -53,8 +54,9 @@ logging.basicConfig(
 logger = logging.getLogger("pi-client")
 
 CHANNELS = 1
-# 80 ms blocks @ 16 kHz — matches microWakeWord streaming windows.
-FRAME_SAMPLES = 1280
+# 80 ms capture @ 48 kHz; after ↓16 kHz → FRAME_SAMPLES for microWakeWord.
+MIC_FRAME_SAMPLES = 3840  # int(MIC_RATE * 0.08)
+FRAME_SAMPLES = 1280  # int(SAMPLE_RATE * 0.08)
 
 # --- Barge / wake tuning ---
 # Env + CLI: BARGE_IN, BARGE_ENERGY_MULT, WAKE_*; optional env below keeps defaults.
@@ -147,20 +149,25 @@ class RnnoiseDenoise:
     """
     Xiph RNNoise on 10 ms / 48 kHz frames, with a light high-pass in front.
 
-    Incoming 16 kHz float frames are resampled, denoised, then returned at
-    16 kHz. State is kept across calls so the GRU sees a continuous stream.
+    Mic frames are expected at 48 kHz (native). High-pass and RNNoise run at
+    48 kHz with no upsample. Output stays at 48 kHz; callers downsample to
+    16 kHz only where needed (microWakeWord, WAV upload).
     """
 
     FRAME = 480
     MODEL_RATE = 48000
 
-    def __init__(self, rate: int = SAMPLE_RATE, hp_hz: float = DEFAULT_NOISE_HP_HZ) -> None:
+    def __init__(self, rate: int = MIC_RATE, hp_hz: float = DEFAULT_NOISE_HP_HZ) -> None:
         self.rate = int(rate)
+        if self.rate != self.MODEL_RATE:
+            raise ValueError(
+                f"RnnoiseDenoise expects {self.MODEL_RATE} Hz mic audio, got {self.rate}"
+            )
         self.hp_hz = float(np.clip(hp_hz, 80.0, 800.0))
-        self.label = f"RNNoise + highpass={self.hp_hz:.0f}Hz"
+        self.label = f"RNNoise + highpass={self.hp_hz:.0f}Hz @{self.rate}Hz"
         self._hp = _Highpass(self.rate, self.hp_hz)
-        self._buf48 = np.zeros(0, dtype=np.float32)
-        self._pending16 = np.zeros(0, dtype=np.float32)
+        self._buf = np.zeros(0, dtype=np.float32)
+        self._pending = np.zeros(0, dtype=np.float32)
         self._lib = _load_librnnoise()
         self._lib.rnnoise_create.restype = ctypes.c_void_p
         self._lib.rnnoise_create.argtypes = [ctypes.c_void_p]
@@ -177,8 +184,8 @@ class RnnoiseDenoise:
 
     def reset(self) -> None:
         self._hp.reset()
-        self._buf48 = np.zeros(0, dtype=np.float32)
-        self._pending16 = np.zeros(0, dtype=np.float32)
+        self._buf = np.zeros(0, dtype=np.float32)
+        self._pending = np.zeros(0, dtype=np.float32)
         if self._st:
             self._lib.rnnoise_destroy(self._st)
         self._st = self._lib.rnnoise_create(None)
@@ -201,31 +208,29 @@ class RnnoiseDenoise:
         if x.size == 0:
             return x
         y = self._hp.process(x)
-        x48 = _resample_int(y, self.rate, self.MODEL_RATE)
-        self._buf48 = np.concatenate([self._buf48, x48]) if self._buf48.size else x48
-        out48: list[np.ndarray] = []
-        while self._buf48.size >= self.FRAME:
+        self._buf = np.concatenate([self._buf, y]) if self._buf.size else y
+        out: list[np.ndarray] = []
+        while self._buf.size >= self.FRAME:
             chunk = np.ascontiguousarray(
-                self._buf48[: self.FRAME] * 32768.0,
+                self._buf[: self.FRAME] * 32768.0,
                 dtype=np.float32,
             )
-            self._buf48 = self._buf48[self.FRAME :]
+            self._buf = self._buf[self.FRAME :]
             ptr = chunk.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
             self._lib.rnnoise_process_frame(self._st, ptr, ptr)
-            out48.append(chunk * (1.0 / 32768.0))
-        if not out48:
+            out.append(chunk * (1.0 / 32768.0))
+        if not out:
             return np.clip(y, -1.0, 1.0)
-        y48 = np.concatenate(out48)
-        y16 = _resample_int(y48, self.MODEL_RATE, self.rate)
-        if self._pending16.size:
-            y16 = np.concatenate([self._pending16, y16])
-        if y16.size >= x.size:
-            self._pending16 = y16[x.size :]
-            y16 = y16[: x.size]
+        y_out = np.concatenate(out)
+        if self._pending.size:
+            y_out = np.concatenate([self._pending, y_out])
+        if y_out.size >= x.size:
+            self._pending = y_out[x.size :]
+            y_out = y_out[: x.size]
         else:
-            y16 = np.pad(y16, (0, x.size - y16.size))
-            self._pending16 = np.zeros(0, dtype=np.float32)
-        return np.clip(y16, -1.0, 1.0)
+            y_out = np.pad(y_out, (0, x.size - y_out.size))
+            self._pending = np.zeros(0, dtype=np.float32)
+        return np.clip(y_out, -1.0, 1.0)
 
 
 def create_mic_denoise(rate: int, hp_hz: float) -> RnnoiseDenoise:
@@ -267,7 +272,7 @@ class VoiceClient:
         self._denoise: RnnoiseDenoise | None = None
         if self.noise_suppress:
             try:
-                self._denoise = create_mic_denoise(SAMPLE_RATE, hp_hz=noise_hp_hz)
+                self._denoise = create_mic_denoise(MIC_RATE, hp_hz=noise_hp_hz)
             except Exception:
                 logger.warning("Mic denoise unavailable — continuing without it", exc_info=True)
                 self.noise_suppress = False
@@ -639,7 +644,7 @@ class VoiceClient:
             stable_needed = max(1, stable_frames)
         score_limit = float(self._mww.probability_cutoff)
 
-        block = FRAME_SAMPLES
+        block = MIC_FRAME_SAMPLES
         q: queue.Queue[np.ndarray] = queue.Queue()
         stable = 0
         use_gate = bool(echo_gate)
@@ -777,7 +782,7 @@ class VoiceClient:
                 self._denoise.reset()
             sync_music_duck()
             with sd.InputStream(
-                samplerate=SAMPLE_RATE,
+                samplerate=MIC_RATE,
                 channels=CHANNELS,
                 dtype="int16",
                 blocksize=block,
@@ -800,10 +805,10 @@ class VoiceClient:
                         frame_f = frame_f * (0.35 / peak)
                     if self._denoise is not None:
                         frame_f = self._denoise.process(frame_f)
-                        mono = np.clip(frame_f * 32768.0, -32768, 32767).astype(np.int16)
-                    else:
-                        mono = np.clip(frame_f * 32768.0, -32768, 32767).astype(np.int16)
-                    frame_energy = self._rms(frame_f)
+                    # ↓16 kHz for microWakeWord + preroll/WAV consumers.
+                    frame_16 = _resample_int(frame_f, MIC_RATE, SAMPLE_RATE)
+                    mono = np.clip(frame_16 * 32768.0, -32768, 32767).astype(np.int16)
+                    frame_energy = self._rms(frame_16)
                     frames_seen += 1
                     peak_energy = max(peak_energy, frame_energy)
                     recent_energy.append(frame_energy)
@@ -878,7 +883,7 @@ class VoiceClient:
                                 set_feeding(False)
                                 stable = 0
                         if not feeding:
-                            pre_burst_f.append(frame_f.copy())
+                            pre_burst_f.append(frame_16.copy())
                             # Open-echo music/alerts: never score speaker bleed as
                             # wake — that used to stop a 15s timer after ~1s.
                             # Jarvis still works when speech clears the gate
@@ -888,9 +893,9 @@ class VoiceClient:
                             )
                             if not score_under_gate:
                                 continue
-                        preroll.append(frame_f.copy())
+                        preroll.append(frame_16.copy())
                     else:
-                        preroll.append(frame_f.copy())
+                        preroll.append(frame_16.copy())
 
                     if (
                         respect_cooldown
@@ -1209,7 +1214,7 @@ class VoiceClient:
         require_speech waits for fresh speech instead of trusting the preroll —
         after a barge-in the preroll is loud from our own reply.
         """
-        block = int(SAMPLE_RATE * 0.1)
+        block = int(MIC_RATE * 0.1)
         silence_blocks = max(1, int(self.silence_sec / 0.1))
         max_blocks = int(self.max_utterance_sec / 0.1)
         wait_sec = start_timeout_sec or self.max_utterance_sec
@@ -1231,7 +1236,7 @@ class VoiceClient:
             lead.append(preroll.astype(np.float32, copy=False))
 
         with sd.InputStream(
-            samplerate=SAMPLE_RATE,
+            samplerate=MIC_RATE,
             channels=CHANNELS,
             dtype="float32",
             blocksize=block,
@@ -1241,13 +1246,15 @@ class VoiceClient:
                 mono = data[:, 0]
                 if self._denoise is not None:
                     mono = self._denoise.process(mono)
-                energy = self._rms(mono)
+                # ↓16 kHz for energy helpers + assist WAV upload.
+                mono16 = _resample_int(mono, MIC_RATE, SAMPLE_RATE)
+                energy = self._rms(mono16)
                 if energy >= self.energy_threshold:
                     heard_live = True
                     silent = 0
-                    frames.append(mono.copy())
+                    frames.append(mono16.copy())
                 elif heard_live:
-                    frames.append(mono.copy())
+                    frames.append(mono16.copy())
                     if energy >= continue_threshold:
                         silent = max(0, silent - 1)
                     else:
@@ -1255,7 +1262,7 @@ class VoiceClient:
                         if silent >= silence_blocks:
                             break
                 else:
-                    frames.append(mono.copy())
+                    frames.append(mono16.copy())
                     if len(frames) > 5:
                         frames.pop(0)
                     if index >= wait_blocks:
@@ -1265,7 +1272,10 @@ class VoiceClient:
                 pad_blocks = max(1, int(RECORD_END_PAD_SEC / 0.1))
                 for _ in range(pad_blocks):
                     data, _ = stream.read(block)
-                    frames.append(data[:, 0].copy())
+                    mono = data[:, 0]
+                    if self._denoise is not None:
+                        mono = self._denoise.process(mono)
+                    frames.append(_resample_int(mono, MIC_RATE, SAMPLE_RATE))
 
         if heard_live:
             threading.Thread(

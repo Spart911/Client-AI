@@ -11,7 +11,11 @@ from typing import Sequence
 
 import numpy as np
 
-SAMPLE_RATE = 16000
+# Capture rate for the USB/HFP mic path (native RNNoise rate).
+MIC_RATE = 48000
+# microWakeWord features + assist WAV upload to the backend.
+WAKE_RATE = 16000
+SAMPLE_RATE = WAKE_RATE
 
 try:
     from scipy.signal import lfilter as _lfilter
@@ -75,7 +79,7 @@ class Highpass:
         z1, z2 = self._z1, self._z2
         b0, b1, b2 = self._b0, self._b1, self._b2
         a1, a2 = self._a1, self._a2
-        # ~5–10 ms of audio @ 16 kHz; balances branch cost vs cache.
+        # ~5 ms @ 48 kHz (or ~16 ms @ 16 kHz); balances branch cost vs cache.
         chunk = 256
         i = 0
         while i < n:

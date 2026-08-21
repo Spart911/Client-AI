@@ -7,7 +7,20 @@ import math
 import numpy as np
 import pytest
 
-from audio_dsp import SAMPLE_RATE, Highpass, echo_gate_energy, resample_int
+from audio_dsp import (
+    MIC_RATE,
+    SAMPLE_RATE,
+    WAKE_RATE,
+    Highpass,
+    echo_gate_energy,
+    resample_int,
+)
+
+
+def test_rate_constants():
+    assert MIC_RATE == 48000
+    assert WAKE_RATE == 16000
+    assert SAMPLE_RATE == WAKE_RATE
 
 
 def test_highpass_random_finite():
@@ -17,6 +30,15 @@ def test_highpass_random_finite():
     y = hp.process(x)
     assert y.shape == x.shape
     assert y.dtype == np.float32
+    assert np.isfinite(y).all()
+
+
+def test_highpass_at_mic_rate():
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal(MIC_RATE).astype(np.float32)
+    hp = Highpass(MIC_RATE, 280.0)
+    y = hp.process(x)
+    assert y.shape == x.shape
     assert np.isfinite(y).all()
 
 
@@ -45,6 +67,19 @@ def test_resample_roundtrip_16_48():
     err = float(np.sqrt(np.mean((back - x) ** 2)))
     assert err < 0.05
     assert np.isfinite(back).all()
+
+
+def test_mic_frame_downsamples_to_wake_frame():
+    """80 ms @ 48 kHz → 1280 samples @ 16 kHz (MWW window)."""
+    rng = np.random.default_rng(3)
+    mic_n = int(MIC_RATE * 0.08)
+    wake_n = int(SAMPLE_RATE * 0.08)
+    assert mic_n == 3840
+    assert wake_n == 1280
+    x = rng.standard_normal(mic_n).astype(np.float32) * 0.1
+    y = resample_int(x, MIC_RATE, SAMPLE_RATE)
+    assert y.size == wake_n
+    assert np.isfinite(y).all()
 
 
 def test_echo_gate_basics():
