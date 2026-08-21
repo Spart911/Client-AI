@@ -68,6 +68,10 @@ journalctl -u voice-client-update.service -n 50
 
 Push в git → на Pi контейнер пересоберётся сам.
 
+## CI
+
+GitHub Actions (`ci.yml`): на push/PR в `main` — `py_compile` модулей, `pytest` (без железа и без скачивания моделей).
+
 ## Bluetooth-колонка (автоподключение)
 
 1. Один раз спарить колонку (`bluetoothctl pair/trust/connect`).
