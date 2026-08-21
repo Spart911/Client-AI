@@ -45,6 +45,12 @@ CHANNELS = 1
 # 80 ms blocks @ 16 kHz — matches microWakeWord streaming windows.
 FRAME_SAMPLES = 1280
 
+# --- Barge / wake tuning ---
+# Env + CLI (see argparse): BARGE_IN, BARGE_ENERGY_MULT, WAKE_ENERGY,
+# WAKE_ACCEPT_ENERGY, WAKE_STABLE_FRAMES, WAKE_COOLDOWN, WAKE_THRESHOLD /
+# OWW_THRESHOLD, MWW_WINDOW, EMPTY_WAKE_COOLDOWN via code path only where noted.
+# Fixed unless overridden by optional env below (defaults unchanged).
+
 # Below this the barge-in gate sits at the speaker bleed level and lets it through.
 BARGE_MULT_MIN = 1.05
 # Open speaker (A2DP + USB mic): TTS bleed is ~real speech RMS. Voice must
@@ -53,12 +59,12 @@ BARGE_TTS_GATE_MULT = 1.50
 BARGE_TTS_PERCENTILE = 0.85
 BARGE_FLOOR_FRAMES = 24
 # Don't score wake until playback has a stable bleed floor.
-BARGE_ARM_SEC = 0.50
+BARGE_ARM_SEC = float(os.getenv("BARGE_ARM_SEC", "0.50"))
 # Soften the reply while we listen for an interrupt — leaves headroom for the
 # mic at any system volume (bleed scales with the speakers, the user's voice does not).
-BARGE_PLAYBACK_GAIN = 0.62
+BARGE_PLAYBACK_GAIN = float(os.getenv("BARGE_PLAYBACK_GAIN", "0.62"))
 # Keep feeding the wake model this long after a burst dips under the gate.
-BARGE_HANGOVER_FRAMES = 4
+BARGE_HANGOVER_FRAMES = int(os.getenv("BARGE_HANGOVER_FRAMES", "4"))
 # Replay the frames just before the burst so the wake phrase keeps its onset.
 BARGE_ONSET_FRAMES = 2
 # Seconds to wait for the actual command after the reply was cut short.
@@ -85,15 +91,15 @@ DEFAULT_MWW_CONFIG = "/app/models/ru_jarvis_mww.json"
 # v2 is specific to the wake word — keep this under real speech energy.
 DEFAULT_WAKE_ACCEPT_ENERGY = 0.003
 # Peak in the recent window must also outrun the quiet floor.
-WAKE_ENERGY_BURST_RATIO = 2.0
+WAKE_ENERGY_BURST_RATIO = float(os.getenv("WAKE_ENERGY_BURST_RATIO", "2.0"))
 # Keep a speech burst alive while microWakeWord's score catches up (80 ms frames).
-WAKE_ENERGY_HANGOVER = 12
+WAKE_ENERGY_HANGOVER = int(os.getenv("WAKE_ENERGY_HANGOVER", "12"))
 # One loud frame is enough — score rises after the word while RMS falls.
 WAKE_SPEECH_MIN_FRAMES = 1
 # Idle listen: consecutive high-score frames while a recent burst is latched.
 WAKE_STABLE_MIN = 3
 # After a wake with no command, stay deaf longer (room noise often re-triggers).
-EMPTY_WAKE_COOLDOWN_SEC = 6.0
+EMPTY_WAKE_COOLDOWN_SEC = float(os.getenv("EMPTY_WAKE_COOLDOWN_SEC", "6.0"))
 # High-pass in front of RNNoise (Hz).
 DEFAULT_NOISE_HP_HZ = 280.0
 
@@ -581,8 +587,9 @@ class VoiceClient:
             response = self._http.get(f"{self.backend_url}/health", timeout=5.0)
             response.raise_for_status()
         except Exception as exc:
-            logger.error("Backend not reachable at %s: %s", self.backend_url, exc)
-            sys.exit(1)
+            raise RuntimeError(
+                f"Backend not reachable at {self.backend_url}: {exc}"
+            ) from exc
 
     def _init_wake(self) -> None:
         self._init_mww()
@@ -591,22 +598,18 @@ class VoiceClient:
         try:
             from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures
         except Exception as exc:
-            logger.error(
-                "microWakeWord import failed (%s). Install: pip install pymicro-wakeword",
-                exc,
-            )
-            sys.exit(1)
+            raise RuntimeError(
+                "microWakeWord import failed. Install: pip install pymicro-wakeword"
+            ) from exc
 
         if not self.mww_model_config:
-            logger.error(
+            raise RuntimeError(
                 "MWW_MODEL_CONFIG is empty. Set path to *_mww.json from microwakeword-trainer."
             )
-            sys.exit(1)
 
         config_path = Path(self.mww_model_config)
         if not config_path.is_file():
-            logger.error("MWW model config not found: %s", config_path)
-            sys.exit(1)
+            raise RuntimeError(f"MWW model config not found: {config_path}")
 
         try:
             self._mww = MicroWakeWord.from_config(config_path)
@@ -626,9 +629,10 @@ class VoiceClient:
                 window,
                 config_path,
             )
+        except RuntimeError:
+            raise
         except Exception as exc:
-            logger.error("microWakeWord init failed: %s", exc)
-            sys.exit(1)
+            raise RuntimeError(f"microWakeWord init failed: {exc}") from exc
 
     def _wait_for_wake(self) -> np.ndarray | None:
         if self._wake_mode != "mww":
@@ -2681,6 +2685,9 @@ def main() -> None:
         client.run()
     except KeyboardInterrupt:
         logger.info("Stopped")
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
     finally:
         client.close()
 

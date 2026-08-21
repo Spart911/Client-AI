@@ -1,3 +1,5 @@
+# Reference unit matching install.sh (system). Paths/User are filled at install
+# from SERVICE_USER + REPO_DIR; example below matches the documented Pi layout.
 [Unit]
 Description=Update voice-client-pi from Git and rebuild Docker
 After=network-online.target docker.service
@@ -9,6 +11,3 @@ Type=oneshot
 User=server-pi
 WorkingDirectory=/home/server-pi/voice-client-pi
 ExecStart=/home/server-pi/voice-client-pi/scripts/update.sh
-
-[Install]
-WantedBy=multi-user.target
