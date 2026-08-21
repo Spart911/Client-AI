@@ -1,12 +1,13 @@
 """
 title: Timer & Alarm (Pi living room)
 author: Client-AI
-version: 0.4.2
+version: 0.4.3
 description: >
   Ставит таймер/будильник через pi-alert:// на Raspberry Pi.
+  Таймер по умолчанию — мелодия classic (как будильник), не отдельный timer-писк.
   В query уходит pi-alert://… — бэкенд кладёт это в очередь без Яндекса.
   Нужен тот же X-Music-Api-Key, что у «Yandex Music Player».
-  ВАЖНО: обнови tool в Open WebUI и задеплой voice-assistant backend.
+  ВАЖНО: обнови tool в Open WebUI после правки.
 required_open_webui_version: 0.4.0
 """
 
@@ -75,11 +76,14 @@ class Tools:
             )
         fire_at = int(time.time()) + total
         title = label.strip() or f"Таймер {self._fmt_duration(total)}"
+        # Prefer classic alarm melody; empty timer_sound_url → builtin classic on Pi.
+        catalog = self._catalog()
+        timer_media = self.valves.timer_sound_url.strip() or catalog.get("classic", "")
         url = self._alert_url(
             "timer",
             fire_at=fire_at,
-            sound="timer",
-            media_url=self.valves.timer_sound_url.strip(),
+            sound="classic",
+            media_url=timer_media,
             loop=0,
             title=title,
         )

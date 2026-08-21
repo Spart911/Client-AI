@@ -1838,12 +1838,14 @@ class VoiceClient:
 
     def _write_builtin_alert(self, kind: str, sound: str) -> Path:
         rate = 16000
-        if kind == "timer":
-            audio = self._synth_timer_tone(rate)
-        elif sound == "digital":
+        sound_key = (sound or "").strip().lower()
+        # Melodies by sound name; kind no longer forces the short timer beep.
+        if sound_key == "digital":
             audio = self._synth_alarm_digital(rate)
-        elif sound == "soft":
+        elif sound_key == "soft":
             audio = self._synth_alarm_soft(rate)
+        elif sound_key == "timer":
+            audio = self._synth_timer_tone(rate)
         else:
             audio = self._synth_alarm_classic(rate)
         fd, name = tempfile.mkstemp(prefix=f"{kind}-", suffix=".wav")
